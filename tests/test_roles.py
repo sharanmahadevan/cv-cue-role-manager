@@ -279,19 +279,29 @@ def test_edit_result_page_links_role_and_ruleset(client):
     assert 'href="/roles/9?loc=3">Open Demo-Sync-B' in html and 'href="/rulesets/basic-web">Open rule set' in html
 
 
-def test_bandwidth_is_stored_in_kbps():
-    # Live CV-CUE: limit 500 with unit 1 (Mbps) displays as 0.49 Mbps, so the stored number is Kbps.
-    f, _ = parse(up_on="1", up="500", up_unit="1", down_on="1", down="750", down_unit="0")
+def test_bandwidth_is_mbps_in_form_and_kbps_in_cvcue():
+    # Live CV-CUE: limit 500 with unit Mbps displays as 0.49 Mbps, so the stored number is Kbps.
+    f, errs = parse(up_on="1", up="500", down_on="1", down="1024")
+    assert not errs
     body = F.apply({}, f, creating=True)
-    assert body["trafficControlUploadLimit"] == 512000 and body["trafficControlUploadLimitUnit"] == 1
-    assert body["trafficControlDownloadLimit"] == 750 and body["trafficControlDownloadLimitUnit"] == 0
+    assert body["trafficControlUploadLimit"] == 500 * 1024 and body["trafficControlUploadLimitUnit"] == 1
+    assert body["trafficControlDownloadLimit"] == 1024 * 1024 and body["trafficControlDownloadLimitUnit"] == 1
     back = F.fields_from_role({**body, "perUserTrafficControlEnabled": True})
-    assert (back["up"], back["up_unit"]) == ("500", "1") and (back["down"], back["down_unit"]) == ("750", "0")
+    assert (back["up_on"], back["up"], back["down"]) == ("1", "500", "1024")
+    for bad in ("0", "1025", "2.5", "abc", ""):
+        _, errs = parse(up_on="1", up=bad)
+        assert errs == ["Upload limit must be a whole number from 1 to 1024 Mbps."], bad
 
 
-def test_existing_kbps_value_not_rounded_into_mbps():
-    # The role saved before the fix: 500 stored with unit Mbps = 500 Kbps; show it as Kbps, not 0 Mbps.
+def test_value_saved_before_the_fix_shows_in_mbps():
+    # Test3 was saved as 500 (Kbps) by the old version: show what CV-CUE shows, 0.488 Mbps.
     f = F.fields_from_role({"perUserTrafficControlEnabled": True, "trafficControlUploadLimit": 500,
                             "trafficControlUploadLimitUnit": 1})
-    assert (f["up_on"], f["up"], f["up_unit"]) == ("1", "500", "0")
-    assert F.from_kbps(1024 * 1024, 1) == ("1024", "1")
+    assert (f["up_on"], f["up"]) == ("1", "0.488")
+    assert F.from_kbps(0) == "" and F.from_kbps(2048) == "2"
+
+
+def test_form_offers_only_mbps(client):
+    c, _ = client
+    html = c.get("/roles/new").text
+    assert "Kbps" not in html and "_unit" not in html and "<span>Mbps</span>" in html

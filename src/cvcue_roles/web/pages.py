@@ -219,15 +219,11 @@ def role_form(mode: str, f: dict, errors: list[str], locations: dict, sets: list
     else:
         loc_field = f'<label>Location<input value="{esc(locations.get(loc, loc))}" disabled></label>'
 
-    def unit(key):
-        return (f'<select name="{key}_unit" aria-label="{key} unit"><option value="1" {sel(key + "_unit", "1", "1")}>Mbps</option>'
-                f'<option value="0" {sel(key + "_unit", "0")}>Kbps</option></select>')
-
     def limit(key, label):
         return (f'<div><label class="opt"><input type="checkbox" name="{key}_on" value="1" {checked(key + "_on")}> '
                 f'Limit the maximum {label} bandwidth per user to</label><div class="row" style="margin-top:6px">'
                 f'<input name="{key}" value="{esc(v(key))}" size="7" inputmode="numeric" aria-label="{label} limit">'
-                f'{unit(key)}<span class="sub" style="margin:0">[1 - 1024 Mbps · 1 - 1048576 Kbps]</span></div></div>')
+                f'<span>Mbps</span><span class="sub" style="margin:0">[1 - 1024]</span></div></div>')
 
     app_fw = ("On in CV-CUE (kept as is)" if role.get("applicationFirewallEnabled") else "Off") if not creating else "Off"
     redirect = (role.get("redirection") or {}).get("webQuarantineEnabled") or (role.get("redirection") or {}).get(
