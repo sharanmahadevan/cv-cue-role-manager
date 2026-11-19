@@ -1,0 +1,42 @@
+# Fly.io config for the CV-CUE role manager.
+# Required secrets (fly secrets set ... --app cv-cue-role-manager):
+#   CVCUE_BASE_URL, CVCUE_KEY_ID, CVCUE_KEY_VALUE   CV-CUE API access (an ADMINISTRATOR key)
+#   SESSION_SECRET                                   random string for sign-in cookies
+#   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET           Google OAuth web client
+#   ALLOWED_EMAILS                                   comma list: me@gmail.com,@arista.com
+
+app = "cv-cue-role-manager"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PUBLIC_URL = "https://cv-cue-role-manager.fly.dev"
+  DB_PATH = "/data/role-manager.db"
+  CVCUE_ROOT_LOCATION = "0"
+  PORT = "8080"
+  LOG_LEVEL = "INFO"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/healthz"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+
+# SQLite lives here; keep exactly one machine (fly scale count 1).
+[mounts]
+  source = "rolemgr_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
