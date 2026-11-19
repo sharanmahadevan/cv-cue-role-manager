@@ -19,6 +19,24 @@ VLAN_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 POOL_RE = re.compile(r"^\d{1,4}(-\d{1,4})?(,\d{1,4}(-\d{1,4})?)*$")
 UNITS = {"0": "Kbps", "1": "Mbps"}
 MAX_LIMIT = {"0": 1048576, "1": 1024}
+KBPS_PER_MBPS = 1024   # CV-CUE stores limits in Kbps; the unit field only picks how its UI shows them
+
+
+def to_kbps(value: str | int, unit: str | int) -> int:
+    """Form value in the chosen unit -> the Kbps number CV-CUE stores."""
+    return int(value) * (KBPS_PER_MBPS if str(unit) == "1" else 1)
+
+
+def from_kbps(kbps: int, unit: int | None) -> tuple[str, str]:
+    """Stored Kbps -> (value, unit) for the form, without losing precision.
+
+    Shown in Mbps only when the role is set to Mbps and the value is a whole number of Mbps.
+    """
+    if not kbps:
+        return "", "1"
+    if unit == 1 and kbps % KBPS_PER_MBPS == 0:
+        return str(kbps // KBPS_PER_MBPS), "1"
+    return str(kbps), "0"
 NEW_RULESET = "__new__"
 
 
@@ -34,6 +52,8 @@ def fields_from_role(role: dict) -> dict:
     tc = bool(role.get("perUserTrafficControlEnabled"))
     up = role.get("trafficControlUploadLimit") or 0
     down = role.get("trafficControlDownloadLimit") or 0
+    up_value, up_unit = from_kbps(up, role.get("trafficControlUploadLimitUnit"))
+    down_value, down_unit = from_kbps(down, role.get("trafficControlDownloadLimitUnit"))
     return {
         "role_name": role.get("role") or role.get("templateName") or "",
         "profile_name": role.get("templateName") or "",
@@ -47,11 +67,11 @@ def fields_from_role(role: dict) -> dict:
         "fw_on": "1" if role.get("firewallEnabled") else "",
         "ruleset": tags[0] if tags else "",
         "up_on": "1" if tc and up else "",
-        "up": str(up or ""),
-        "up_unit": str(role.get("trafficControlUploadLimitUnit") if up else 1),
+        "up": up_value,
+        "up_unit": up_unit,
         "down_on": "1" if tc and down else "",
-        "down": str(down or ""),
-        "down_unit": str(role.get("trafficControlDownloadLimitUnit") if down else 1),
+        "down": down_value,
+        "down_unit": down_unit,
     }
 
 
@@ -150,9 +170,9 @@ def apply(body: dict, f: dict, *, creating: bool) -> dict:
 
     up_on, down_on = bool(f.get("up_on")), bool(f.get("down_on"))
     body["perUserTrafficControlEnabled"] = up_on or down_on
-    body["trafficControlUploadLimit"] = int(f["up"]) if up_on else 0
+    body["trafficControlUploadLimit"] = to_kbps(f["up"], f.get("up_unit") or 1) if up_on else 0
     body["trafficControlUploadLimitUnit"] = int(f.get("up_unit") or 1) if up_on else 0
-    body["trafficControlDownloadLimit"] = int(f["down"]) if down_on else 0
+    body["trafficControlDownloadLimit"] = to_kbps(f["down"], f.get("down_unit") or 1) if down_on else 0
     body["trafficControlDownloadLimitUnit"] = int(f.get("down_unit") or 1) if down_on else 0
 
     if creating:

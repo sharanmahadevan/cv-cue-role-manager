@@ -16,3 +16,5 @@ CV-CUE API facts the code relies on (verified against a live server):
 - `orderId` is renumbered 1-based on create but kept as sent on update: compare by relative order
   (`rules.from_role` sorts and drops ids).
 - Codes: direction 0 any/1 in/2 out; protocol 0 any/1 TCP/2 UDP/N+3 other; action 1 allow/2 block.
+- Bandwidth limits (`trafficControl{Upload,Download}Limit`) are stored in Kbps (1 Mbps = 1024 Kbps);
+  `*LimitUnit` (0 Kbps, 1 Mbps) only picks the CV-CUE display unit. Convert in `roleform.to_kbps/from_kbps`.

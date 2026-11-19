@@ -63,7 +63,7 @@ def test_apply_maps_cvcue_fields():
     assert body["role"] == "staff-role" and body["templateName"] == "Staff Profile"
     assert body["inheritFromSSID"] and body["vlanPoolingEnabled"] and body["vlanPool"] == "10,20-29"
     assert body["vlanId"] == 10 and body["firewallEnabled"] is False
-    assert body["perUserTrafficControlEnabled"] and body["trafficControlUploadLimit"] == 5
+    assert body["perUserTrafficControlEnabled"] and body["trafficControlUploadLimit"] == 5 * 1024
     assert body["trafficControlDownloadLimit"] == 0
     assert F.check(body, f) == []
 
@@ -84,7 +84,7 @@ async def test_create_with_ruleset(setup):
     new = api.roles[run["results"][0]["template_id"]]
     assert new["templateName"] == "Staff" and new["vlanId"] == 40 and new["vlanEnabled"]
     assert new["description"] == "Employees ruleset:basic-web"
-    assert new["trafficControlDownloadLimit"] == 20 and new["perUserTrafficControlEnabled"]
+    assert new["trafficControlDownloadLimit"] == 20 * 1024 and new["perUserTrafficControlEnabled"]
     assert R.fingerprint(R.from_role(new)) == R.fingerprint(store.versions("basic-web")[0]["content"])
     status = {r.role["templateName"]: r.status for r in await portal.role_rows()}
     assert status["Staff"] == "in_sync"
@@ -277,3 +277,21 @@ def test_edit_result_page_links_role_and_ruleset(client):
                                          "profile_name": "Demo-Sync-B", "vlan_on": "1", "vlan_type": "id",
                                          "vlan_id": "20", "fw_on": "1", "ruleset": "basic-web"}).text
     assert 'href="/roles/9?loc=3">Open Demo-Sync-B' in html and 'href="/rulesets/basic-web">Open rule set' in html
+
+
+def test_bandwidth_is_stored_in_kbps():
+    # Live CV-CUE: limit 500 with unit 1 (Mbps) displays as 0.49 Mbps, so the stored number is Kbps.
+    f, _ = parse(up_on="1", up="500", up_unit="1", down_on="1", down="750", down_unit="0")
+    body = F.apply({}, f, creating=True)
+    assert body["trafficControlUploadLimit"] == 512000 and body["trafficControlUploadLimitUnit"] == 1
+    assert body["trafficControlDownloadLimit"] == 750 and body["trafficControlDownloadLimitUnit"] == 0
+    back = F.fields_from_role({**body, "perUserTrafficControlEnabled": True})
+    assert (back["up"], back["up_unit"]) == ("500", "1") and (back["down"], back["down_unit"]) == ("750", "0")
+
+
+def test_existing_kbps_value_not_rounded_into_mbps():
+    # The role saved before the fix: 500 stored with unit Mbps = 500 Kbps; show it as Kbps, not 0 Mbps.
+    f = F.fields_from_role({"perUserTrafficControlEnabled": True, "trafficControlUploadLimit": 500,
+                            "trafficControlUploadLimitUnit": 1})
+    assert (f["up_on"], f["up"], f["up_unit"]) == ("1", "500", "0")
+    assert F.from_kbps(1024 * 1024, 1) == ("1024", "1")
