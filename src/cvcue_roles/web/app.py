@@ -235,22 +235,42 @@ def create_app(cfg: Settings, api=None) -> Starlette:
         published = {s["name"] for s in sets if s["latest"]}
         return names, published, sets, locs
 
+    def _start_new_ruleset(request: Request, back: str, f: dict) -> Response:
+        """Park the role form and go create a rule set; the form comes back with it selected."""
+        values = {k: v for k, v in f.items() if k not in ("csrf", "ruleset", "name")}
+        request.session["role_draft"] = {"back": back, "values": values, "ruleset": None,
+                                         "label": f.get("profile_name") or "new role profile"}
+        return RedirectResponse("/rulesets/new", 303)
+
+    def _resume(request: Request, f: dict, published: set[str]) -> tuple[dict, list[str]]:
+        draft = request.session.pop("role_draft", None)
+        if not draft:
+            return f, []
+        f = {**f, **draft["values"]}
+        notes = []
+        name = draft.get("ruleset")
+        if name and name in published:
+            f["ruleset"], f["fw_on"] = name, "1"
+        elif name:
+            notes.append(f"Rule set {name} isn't published yet. Publish it to select it here.")
+        return f, notes
+
     async def role_new(request: Request) -> Response:
         names, published, sets, locs = await _form_context()
         if request.method == "GET":
-            first = str(next(iter(locs), ""))
-            default_loc = str(cfg.root_location) if cfg.root_location in locs and cfg.root_location != 0 else first
-            # prefer the location most role profiles already use
             roles = await portal.raw_roles()
             used = [(r.get("createdAtLocationId") or {}).get("id") for r in roles]
             common = max(set(used), key=used.count) if used else None
-            f = {"vlan_mode": "ssid", "location": str(common if common in locs else default_loc), "down_unit": "1",
-                 "up_unit": "1"}
-            return page(request, "Add role profile", P.role_form("create", f, [], locs, sets), "roles")
+            loc = common if common in locs else next(iter(locs), "")
+            f, notes = (_resume(request, F.new_fields(str(loc)), published) if request.query_params.get("resume")
+                        else (F.new_fields(str(loc)), []))
+            return page(request, "Add role profile", P.role_form("create", f, notes, locs, sets), "roles")
         form = dict(await request.form())
         f, errors = F.parse(form, existing_names=names, published=published, creating=True, locations=locs)
         if errors:
             return page(request, "Add role profile", P.role_form("create", f, errors, locs, sets), "roles", 400)
+        if f.get("ruleset") == F.NEW_RULESET:
+            return _start_new_ruleset(request, "/roles/new?resume=1", f)
         try:
             run_id = await portal.create_role(f, user_of(request))
         except ValueError as exc:
@@ -266,21 +286,29 @@ def create_app(cfg: Settings, api=None) -> Starlette:
         current = tags[0] if tags else ""
         names, published, sets, locs = await _form_context(exclude_tid=tid)
         all_locs = await portal.locations()
+        title = f"Edit {role.get('templateName')}"
+
+        def render(f, errors, status=200):
+            f["orig_name"] = role.get("templateName")
+            return page(request, title, P.role_form("edit", f, errors, all_locs, sets, current, tid, loc, role),
+                        "roles", status)
+
         if request.method == "GET":
             f = F.fields_from_role(role)
-            f["orig_name"] = role.get("templateName")
-            return page(request, f"Edit {role.get('templateName')}",
-                        P.role_form("edit", f, [], all_locs, sets, current, tid, loc), "roles")
-        f, errors = F.parse(form, existing_names=names, published=published, current_ruleset=current, creating=False)
-        f["orig_name"] = role.get("templateName")
+            notes = []
+            if request.query_params.get("resume"):
+                f, notes = _resume(request, f, published)
+            return render(f, notes)
+        f, errors = F.parse(form, existing_names=names, published=published, current_ruleset=current, creating=False,
+                            keep_allowed=bool(role.get("firewallEnabled")))
         if errors:
-            return page(request, f"Edit {role.get('templateName')}",
-                        P.role_form("edit", f, errors, all_locs, sets, current, tid, loc), "roles", 400)
+            return render(f, errors, 400)
+        if f.get("ruleset") == F.NEW_RULESET:
+            return _start_new_ruleset(request, f"/roles/{tid}/edit?loc={loc}&resume=1", f)
         try:
             run_id = await portal.update_role(tid, loc, f, user_of(request))
         except ValueError as exc:
-            return page(request, f"Edit {role.get('templateName')}",
-                        P.role_form("edit", f, [str(exc)], all_locs, sets, current, tid, loc), "roles", 400)
+            return render(f, [str(exc)], 400)
         return RedirectResponse(f"/runs/{run_id}", 303)
 
     async def role_delete(request: Request) -> Response:
@@ -312,20 +340,34 @@ def create_app(cfg: Settings, api=None) -> Starlette:
         form = await request.form()
         name = str(form.get("name", "")).strip()
         desc = str(form.get("description", "")).strip()[:200]
+        back = "/rulesets/new" if form.get("for_role") else "/rulesets"
         if not R.NAME_RE.match(name):
             flash(request, "error", "Use 1-48 letters, numbers, dots, dashes, or underscores for the name.")
-            return RedirectResponse("/rulesets", 303)
+            return RedirectResponse(back, 303)
         if await db(store.get_ruleset, name):
             flash(request, "error", f"A rule set named {name} already exists.")
-            return RedirectResponse("/rulesets", 303)
+            return RedirectResponse(back, 303)
         content = R.empty_content()
         source = str(form.get("source", ""))
         if source.startswith("role:"):
             _, tid, loc = source.split(":", 2)
             _, content = await portal.role_content(int(tid), int(loc) if loc.lstrip("-").isdigit() else loc)
         await db(store.create_ruleset, name, desc, content, user_of(request))
-        flash(request, "ok", f"Created {name}. Edit the rules, then review and publish.")
+        draft = request.session.get("role_draft")
+        if draft and form.get("for_role"):
+            draft["ruleset"] = name
+            request.session["role_draft"] = draft
+        flash(request, "ok", f"Created {name}. Add rules, then review and publish.")
         return RedirectResponse(f"/rulesets/{name}", 303)
+
+    async def ruleset_new(request: Request) -> Response:
+        rows = await portal.role_rows()
+        sources = [r for r in rows if r.role.get("firewallEnabled")]
+        return page(request, "New rule set", P.ruleset_new(request.session.get("role_draft"), sources), "rulesets")
+
+    def role_draft_for(request: Request, name: str) -> dict | None:
+        draft = request.session.get("role_draft")
+        return draft if draft and draft.get("ruleset") == name else None
 
     async def ruleset_page(request: Request) -> Response:
         name = request.path_params["name"]
@@ -337,7 +379,8 @@ def create_app(cfg: Settings, api=None) -> Starlette:
             return page(request, "Not found", P.message("That rule set doesn't exist."), "rulesets", 404)
         edit = request.query_params.get("edit")
         edit_i = int(edit) if edit and edit.isdigit() and int(edit) < len(rs["draft"]["rules"]) else None
-        return page(request, name, P.ruleset_editor(rs, rows, edit_i, request.session.pop("form_errors", None)),
+        return page(request, name, P.ruleset_editor(rs, rows, edit_i, request.session.pop("form_errors", None),
+                                                          role_draft_for(request, name)),
                     "rulesets")
 
     async def ruleset_edit(request: Request) -> Response:
@@ -400,7 +443,7 @@ def create_app(cfg: Settings, api=None) -> Starlette:
             plan = await portal.plan(name)
         except KeyError:
             return page(request, "Not found", P.message("That rule set doesn't exist."), "rulesets", 404)
-        return page(request, f"Review {name}", P.review(plan), "rulesets")
+        return page(request, f"Review {name}", P.review(plan, role_draft_for(request, name)), "rulesets")
 
     async def ruleset_publish(request: Request) -> Response:
         name = request.path_params["name"]
@@ -460,7 +503,7 @@ def create_app(cfg: Settings, api=None) -> Starlette:
         run = await db(store.get_run, int(request.path_params["rid"]))
         if run is None:
             return page(request, "Not found", P.message("That run doesn't exist."), "activity", 404)
-        return page(request, f"Run {run['id']}", P.run(run), "activity")
+        return page(request, f"Run {run['id']}", P.run(run, role_draft_for(request, run["ruleset"])), "activity")
 
     async def healthz(_: Request) -> Response:
         return JSONResponse({"ok": True})
@@ -489,6 +532,7 @@ def create_app(cfg: Settings, api=None) -> Starlette:
         Route("/roles/{tid:int}/{action}", protected(role_action), methods=["POST"]),
         Route("/rulesets", protected(rulesets_page)),
         Route("/rulesets", protected(ruleset_create), methods=["POST"]),
+        Route("/rulesets/new", protected(ruleset_new)),
         Route("/rulesets/{name}", protected(ruleset_page)),
         Route("/rulesets/{name}/edit", protected(ruleset_edit), methods=["POST"]),
         Route("/rulesets/{name}/review", protected(ruleset_review)),

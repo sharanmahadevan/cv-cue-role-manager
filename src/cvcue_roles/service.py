@@ -329,7 +329,7 @@ class Portal:
                 created = await self.api.post(ROLES_PATH, params={"locationid": loc}, json=body)
                 tid = (created or {}).get("templateId")
                 if tid is None:
-                    match = [r for r in await self.raw_roles() if r.get("templateName") == f["name"]]
+                    match = [r for r in await self.raw_roles() if r.get("templateName") == f["profile_name"]]
                     tid = match[0]["templateId"] if match else None
                 if tid is None:
                     msg = "CV-CUE accepted the request, but the new role profile wasn't found."
@@ -342,8 +342,8 @@ class Portal:
                     msg = "Created and verified" if good else "Created, but these didn't match: " + ", ".join(problems)
             except Exception as exc:  # noqa: BLE001
                 msg = str(exc)
-            await self._db(self.store.add_result, run_id, tid or 0, f["name"], loc, good, msg)
-            await self._db(self.store.finish_run, run_id, f"Created {f['name']}" if tid else "Create failed")
+            await self._db(self.store.add_result, run_id, tid or 0, f["profile_name"], loc, good, msg)
+            await self._db(self.store.finish_run, run_id, f"Created {f['profile_name']}" if tid else "Create failed")
             return run_id
 
     async def update_role(self, template_id: int, location_id: Any, f: dict, user: str) -> int:
@@ -364,14 +364,15 @@ class Portal:
                 problems = F.check(saved, f)
                 if version and R.fingerprint(R.from_role(saved)) != R.fingerprint(version["content"]):
                     problems.append("firewall rules")
-                if not version and R.fingerprint(R.from_role(saved)) != R.fingerprint(R.from_role(role)):
+                if (not version and f.get("fw_on") and role.get("firewallEnabled")
+                        and R.fingerprint(R.from_role(saved)) != R.fingerprint(R.from_role(role))):
                     problems.append("firewall rules changed unexpectedly")
                 good = not problems
                 msg = "Saved and verified" if good else "Saved, but these didn't match: " + ", ".join(problems)
             except Exception as exc:  # noqa: BLE001
                 good, msg = False, str(exc)
-            await self._db(self.store.add_result, run_id, template_id, f["name"], location_id, good, msg)
-            await self._db(self.store.finish_run, run_id, f"Edited {f['name']}" if good else "Edit failed")
+            await self._db(self.store.add_result, run_id, template_id, f["profile_name"], location_id, good, msg)
+            await self._db(self.store.finish_run, run_id, f"Edited {f['profile_name']}" if good else "Edit failed")
             return run_id
 
     async def delete_role(self, template_id: int, location_id: Any, user: str) -> int:
