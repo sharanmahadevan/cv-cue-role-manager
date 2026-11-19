@@ -560,6 +560,11 @@ def ruleset_editor(rs, rows, edit_i, form_errors, role_draft=None) -> str:
 
 
 def rule_form(name, draft, edit_i, form_errors) -> str:
+    """Add/edit one rule, laid out like CV-CUE: the fields shown depend on the protocol.
+
+    Any: name, IP/hostname, action, protocol. Other: plus protocol number [0-254].
+    TCP/UDP: plus port [0-65535] and direction.
+    """
     values = {}
     if form_errors:
         values = form_errors.get("values", {})
@@ -577,24 +582,36 @@ def rule_form(name, draft, edit_i, form_errors) -> str:
         return f'<option value="{value}" {"selected" if (v(field) or default) == value else ""}>{label}</option>'
 
     title = f"Edit rule {edit_i + 1}" if edit_i is not None else "Add a rule"
+    script = ('<script>(function(){var f=document.getElementById("ruleForm");if(!f)return;'
+              'function sync(){var p=f.querySelector("select[name=protocol]").value;'
+              'var k=p==="1"||p==="2"?"tcpudp":p==="other"?"other":"any";'
+              'f.querySelectorAll("[data-show]").forEach(function(e){var on=e.dataset.show.split(" ").indexOf(k)>=0;'
+              'e.hidden=!on;e.querySelectorAll("input,select").forEach(function(i){i.disabled=!on;});});'
+              'f.querySelector("input[name=protocol_number]").required=k==="other";}'
+              'f.querySelector("select[name=protocol]").addEventListener("change",sync);sync();})();</script>')
     return (f'<div class="card" id="rule-form"><h2>{title}</h2>' + (f'<ul class="errors">{errs}</ul>' if errs else "") +
-            f'<form method="post" action="/rulesets/{esc(name)}/edit" class="row" style="align-items:flex-end">{CSRF}'
+            f'<form method="post" action="/rulesets/{esc(name)}/edit" id="ruleForm">{CSRF}'
             f'<input type="hidden" name="op" value="{op}">'
             + (f'<input type="hidden" name="i" value="{edit_i}">' if edit_i is not None else "") +
-            f'<label>Rule name<input name="name" value="{esc(v("name"))}" placeholder="Allow-HTTPS" required></label>'
-            '<label>Direction<select name="direction">' + opt("direction", "2", "Out", "2") + opt("direction", "1", "In") +
-            opt("direction", "0", "Any") + "</select></label>"
-            '<label>Protocol<select name="protocol">' + opt("protocol", "1", "TCP", "1") + opt("protocol", "2", "UDP") +
-            opt("protocol", "0", "Any") + opt("protocol", "other", "Other IP protocol") + "</select></label>"
-            f'<label>Protocol no.<input name="protocol_number" value="{esc(v("protocol_number"))}" size="4" placeholder="47"></label>'
-            f'<label>Port<input name="port" value="{esc(v("port"))}" size="9" placeholder="443"></label>'
-            f'<label>Hostname<input name="host" value="{esc(v("host"))}" placeholder="Any"></label>'
-            '<label>Action<select name="action">' + opt("action", "1", "Allow", "1") + opt("action", "2", "Block") +
-            "</select></label>"
+            '<div class="grid" style="grid-template-columns:repeat(3,minmax(0,1fr));align-items:start">'
+            f'<label style="grid-area:1/1"><span>Rule name<span class="req">*</span></span><input name="name" value="{esc(v("name"))}" '
+            'placeholder="Allow-HTTPS" required maxlength="64"></label>'
+            f'<label style="grid-area:1/2">IP/Hostname<input name="host" value="{esc(v("host"))}" placeholder="*"></label>'
+            f'<label data-show="tcpudp" style="grid-area:1/3">Port<span class="row" style="flex-wrap:nowrap"><input name="port" value="{esc(v("port"))}" '
+            'placeholder="*" style="flex:1;min-width:0"><span class="sub" style="margin:0;white-space:nowrap">[0-65535]</span></span></label>'
+            '<label style="grid-area:2/1">Action<select name="action">' + opt("action", "1", "Allow", "1") + opt("action", "2", "Block") + "</select></label>"
+            '<label style="grid-area:2/2">Protocol<select name="protocol">' + opt("protocol", "1", "TCP", "1") + opt("protocol", "2", "UDP") +
+            opt("protocol", "0", "Any") + opt("protocol", "other", "Other") + "</select></label>"
+            '<label data-show="tcpudp" style="grid-area:2/3">Direction<select name="direction">' + opt("direction", "2", "Outgoing", "2") +
+            opt("direction", "1", "Incoming") + opt("direction", "0", "Any") + "</select></label>"
+            f'<label data-show="other" style="grid-area:2/3"><span>Protocol number<span class="req">*</span></span><span class="row" style="flex-wrap:nowrap">'
+            f'<input name="protocol_number" value="{esc(v("protocol_number"))}" inputmode="numeric" placeholder="47" '
+            'style="flex:1;min-width:0"><span class="sub" style="margin:0;white-space:nowrap">[0-254]</span></span></label>'
+            '</div><div class="row" style="margin-top:14px">'
             f'<button class="primary">{"Save rule" if edit_i is not None else "Add rule"}</button>'
             + (f'<a class="btn" href="/rulesets/{esc(name)}">Cancel</a>' if edit_i is not None else "") +
-            '</form><p class="sub" style="margin:10px 0 0">Changes go into the draft. Nothing reaches CV-CUE until you review and publish. '
-            'Protocol no. is used only with "Other IP protocol"; leave port empty for any port.</p></div>')
+            '</div></form><p class="sub" style="margin:10px 0 0">Changes go into the draft. Nothing reaches CV-CUE until you '
+            'review and publish. Leave IP/Hostname or Port empty (or *) for any.</p></div>' + script)
 
 
 def review(plan, draft=None) -> str:

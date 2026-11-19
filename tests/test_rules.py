@@ -58,13 +58,30 @@ def test_diff_shows_added_rule_and_firewall_on():
 
 def test_rule_form_validation():
     rule, errs = R.rule_from_form({"name": "Web", "direction": "2", "protocol": "1", "port": "443", "action": "1"})
-    assert not errs and rule["port"] == "443"
-    _, errs = R.rule_from_form({"name": "", "protocol": "0", "port": "80", "action": "1"})
-    assert "Enter a rule name." in errs and any("TCP or UDP" in e for e in errs)
-    rule, errs = R.rule_from_form({"name": "GRE", "protocol": "other", "protocol_number": "47", "action": "1"})
-    assert not errs and rule["protocol"] == 50
-    _, errs = R.rule_from_form({"name": "x", "protocol": "1", "port": "70000", "action": "1"})
-    assert errs
+    assert not errs and rule["port"] == "443" and rule["direction"] == 2
+    _, errs = R.rule_from_form({"name": "", "protocol": "1", "port": "70000", "action": "1"})
+    assert "Enter a rule name." in errs and any("0 to 65535" in e for e in errs)
+    rule, errs = R.rule_from_form({"name": "x", "protocol": "2", "port": "*", "host": "*", "direction": "1",
+                                   "action": "2"})
+    assert not errs and rule["port"] == "" and rule["host"] == "" and rule["direction"] == 1
+
+
+def test_any_protocol_ignores_port_and_direction():
+    # CV-CUE shows only name, IP/hostname, action, and protocol for "Any"
+    rule, errs = R.rule_from_form({"name": "Allow-Https", "protocol": "0", "host": "*", "port": "443",
+                                   "direction": "1", "action": "1"})
+    assert not errs and (rule["protocol"], rule["port"], rule["direction"], rule["host"]) == (0, "", 0, "")
+
+
+def test_other_protocol_needs_number_0_to_254():
+    rule, errs = R.rule_from_form({"name": "GRE", "protocol": "other", "protocol_number": "47", "port": "80",
+                                   "direction": "2", "action": "1"})
+    assert not errs and rule["protocol"] == 50 and rule["port"] == "" and rule["direction"] == 0
+    rule, errs = R.rule_from_form({"name": "HOPOPT", "protocol": "other", "protocol_number": "0", "action": "1"})
+    assert not errs and rule["protocol"] == 3
+    for bad in ("", "255", "x"):
+        _, errs = R.rule_from_form({"name": "x", "protocol": "other", "protocol_number": bad, "action": "1"})
+        assert errs == ["Enter a protocol number from 0 to 254."]
 
 
 def test_import_formats():

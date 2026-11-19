@@ -151,41 +151,48 @@ def diff(have: dict | None, want: dict) -> list[tuple[str, str]]:
 
 # ------------------------------------------------------------ form validation
 def rule_from_form(form: dict) -> tuple[dict | None, list[str]]:
+    """Validate one rule from the editor form, following CV-CUE's rule editor:
+
+    - Any: name, IP/hostname, action. Port and direction don't apply (saved as any).
+    - Other: as Any, plus a required IP protocol number 0-254.
+    - TCP/UDP: as Any, plus port (0-65535 or a range) and direction.
+    A blank or "*" IP/hostname or port means any.
+    """
     errors: list[str] = []
     name = str(form.get("name", "")).strip()
     if not name:
         errors.append("Enter a rule name.")
     elif len(name) > 64:
         errors.append("Rule name must be 64 characters or fewer.")
-    try:
-        direction = int(form.get("direction", 2))
-        assert direction in DIRECTIONS
-    except (ValueError, AssertionError):
-        errors.append("Pick a direction.")
-        direction = 2
     proto_choice = str(form.get("protocol", "1"))
+    direction, port = 0, ""
     if proto_choice == "other":
-        try:
-            num = int(str(form.get("protocol_number", "")).strip())
-            assert 0 <= num <= 255
-            protocol = num + 3
-        except (ValueError, AssertionError):
-            errors.append("Enter an IP protocol number from 0 to 255.")
+        raw = str(form.get("protocol_number", "")).strip()
+        if raw.isdigit() and 0 <= int(raw) <= 254:
+            protocol = int(raw) + 3
+        else:
+            errors.append("Enter a protocol number from 0 to 254.")
             protocol = 0
+    elif proto_choice in ("0", "1", "2"):
+        protocol = int(proto_choice)
     else:
+        errors.append("Pick a protocol.")
+        protocol = 0
+    if protocol in (1, 2) and proto_choice != "other":
         try:
-            protocol = int(proto_choice)
-            assert protocol in (0, 1, 2)
+            direction = int(form.get("direction", 2))
+            assert direction in DIRECTIONS
         except (ValueError, AssertionError):
-            errors.append("Pick a protocol.")
-            protocol = 0
-    port = str(form.get("port", "")).strip()
-    if port:
-        if protocol not in (1, 2):
-            errors.append("Ports apply to TCP or UDP rules only.")
-        elif not _PORT_RE.match(port) or any(not 0 < int(p) < 65536 for p in port.split("-")):
-            errors.append("Enter a port from 1 to 65535, or a range like 8000-8100.")
+            errors.append("Pick a direction.")
+            direction = 2
+        port = str(form.get("port", "")).strip()
+        if port == "*":
+            port = ""
+        if port and (not _PORT_RE.match(port) or any(not 0 <= int(p) <= 65535 for p in port.split("-"))):
+            errors.append("Enter a port from 0 to 65535, or a range like 8000-8100.")
     host = str(form.get("host", "")).strip()
+    if host == "*":
+        host = ""
     if host and not _HOST_RE.match(host):
         errors.append("Enter a hostname, IP address, or subnet like 10.0.0.0/8.")
     try:

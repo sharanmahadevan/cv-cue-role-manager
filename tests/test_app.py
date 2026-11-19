@@ -91,3 +91,22 @@ def test_create_from_role_and_export(client):
     assert "Allow-MQTT-TLS" in r.text
     exported = c.get("/rulesets/from-test/export?which=draft").json()
     assert exported["name"] == "from-test" and exported["firewallProfile"][-1]["defaultRule"]
+
+
+def test_rule_form_fields_follow_protocol(client):
+    c, api = client
+    html = c.get("/rulesets/basic-web").text
+    assert 'data-show="tcpudp" style="grid-area:1/3">Port' in html and '>Direction<select' in html
+    assert '<span>Protocol number' in html and "[0-254]" in html
+    token = csrf_of(html)
+    # "Any" saves with no port and direction "any" even if hidden fields were sent
+    c.post("/rulesets/basic-web/edit", data={"csrf": token, "op": "add", "name": "Allow-Https", "protocol": "0",
+                                              "host": "*", "port": "443", "direction": "1", "action": "1"})
+    c.post("/rulesets/basic-web/edit", data={"csrf": token, "op": "add", "name": "GRE", "protocol": "other",
+                                              "protocol_number": "47", "action": "1"})
+    store = c.app.state.store
+    rules = store.get_ruleset("basic-web")["draft"]["rules"]
+    assert (rules[-2]["protocol"], rules[-2]["port"], rules[-2]["direction"]) == (0, "", 0)
+    assert (rules[-1]["protocol"], rules[-1]["port"], rules[-1]["direction"]) == (50, "", 0)
+    edit = c.get(f"/rulesets/basic-web?edit={len(rules) - 1}").text
+    assert '<option value="other" selected>Other</option>' in edit and 'value="47"' in edit
