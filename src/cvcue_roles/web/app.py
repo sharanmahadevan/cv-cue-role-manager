@@ -17,6 +17,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 
+from .. import roleform as F
 from .. import rules as R
 from ..client import CvcueClient, CvcueError
 from ..config import Settings
@@ -216,6 +217,89 @@ def create_app(cfg: Settings, api=None) -> Starlette:
             return RedirectResponse(f"/roles/{tid}?loc={loc}", 303)
         return RedirectResponse(f"/runs/{run_id}", 303)
 
+    # ------------------------------------------------------------ create / edit / delete role profiles
+    async def role_pick(request: Request) -> Response:
+        """Toolbar buttons on the roles list: route the selected radio button to edit or delete."""
+        sel = request.query_params.get("sel", "")
+        tid, _, loc = sel.partition(":")
+        if not tid.isdigit():
+            flash(request, "error", "Select a role profile first.")
+            return RedirectResponse("/roles", 303)
+        verb = "edit" if request.url.path.endswith("/edit") else "delete"
+        return RedirectResponse(f"/roles/{tid}/{verb}?loc={quote(loc)}", 303)
+
+    async def _form_context(exclude_tid: int | None = None):
+        roles, sets, locs = await asyncio.gather(portal.raw_roles(), db(store.list_rulesets),
+                                                 portal.folder_locations())
+        names = {(r.get("templateName") or "").lower() for r in roles if r.get("templateId") != exclude_tid}
+        published = {s["name"] for s in sets if s["latest"]}
+        return names, published, sets, locs
+
+    async def role_new(request: Request) -> Response:
+        names, published, sets, locs = await _form_context()
+        if request.method == "GET":
+            first = str(next(iter(locs), ""))
+            default_loc = str(cfg.root_location) if cfg.root_location in locs and cfg.root_location != 0 else first
+            # prefer the location most role profiles already use
+            roles = await portal.raw_roles()
+            used = [(r.get("createdAtLocationId") or {}).get("id") for r in roles]
+            common = max(set(used), key=used.count) if used else None
+            f = {"vlan_mode": "ssid", "location": str(common if common in locs else default_loc), "down_unit": "1",
+                 "up_unit": "1"}
+            return page(request, "Add role profile", P.role_form("create", f, [], locs, sets), "roles")
+        form = dict(await request.form())
+        f, errors = F.parse(form, existing_names=names, published=published, creating=True, locations=locs)
+        if errors:
+            return page(request, "Add role profile", P.role_form("create", f, errors, locs, sets), "roles", 400)
+        try:
+            run_id = await portal.create_role(f, user_of(request))
+        except ValueError as exc:
+            return page(request, "Add role profile", P.role_form("create", f, [str(exc)], locs, sets), "roles", 400)
+        return RedirectResponse(f"/runs/{run_id}", 303)
+
+    async def role_edit(request: Request) -> Response:
+        tid = int(request.path_params["tid"])
+        form = dict(await request.form()) if request.method == "POST" else {}
+        loc = loc_param(request, form if request.method == "POST" else None)
+        role = await portal.get_role(tid, loc)
+        tags = R.tags_of(role)
+        current = tags[0] if tags else ""
+        names, published, sets, locs = await _form_context(exclude_tid=tid)
+        all_locs = await portal.locations()
+        if request.method == "GET":
+            f = F.fields_from_role(role)
+            f["orig_name"] = role.get("templateName")
+            return page(request, f"Edit {role.get('templateName')}",
+                        P.role_form("edit", f, [], all_locs, sets, current, tid, loc), "roles")
+        f, errors = F.parse(form, existing_names=names, published=published, current_ruleset=current, creating=False)
+        f["orig_name"] = role.get("templateName")
+        if errors:
+            return page(request, f"Edit {role.get('templateName')}",
+                        P.role_form("edit", f, errors, all_locs, sets, current, tid, loc), "roles", 400)
+        try:
+            run_id = await portal.update_role(tid, loc, f, user_of(request))
+        except ValueError as exc:
+            return page(request, f"Edit {role.get('templateName')}",
+                        P.role_form("edit", f, [str(exc)], all_locs, sets, current, tid, loc), "roles", 400)
+        return RedirectResponse(f"/runs/{run_id}", 303)
+
+    async def role_delete(request: Request) -> Response:
+        tid = int(request.path_params["tid"])
+        form = dict(await request.form()) if request.method == "POST" else None
+        loc = loc_param(request, form)
+        if request.method == "POST":
+            try:
+                run_id = await portal.delete_role(tid, loc, user_of(request))
+            except ValueError as exc:
+                flash(request, "error", str(exc))
+                return RedirectResponse(f"/roles/{tid}?loc={loc}", 303)
+            return RedirectResponse(f"/runs/{run_id}", 303)
+        role = await portal.get_role(tid, loc)
+        locs = await portal.locations()
+        row = portal.classify(role, locs.get(loc, f"Location {loc}"), {})
+        refs = await portal.references(tid, loc)
+        return page(request, f"Delete {role.get('templateName')}", P.role_delete(row, refs), "roles")
+
     # ------------------------------------------------------------ rule sets
     async def rulesets_page(request: Request) -> Response:
         sets = await db(store.list_rulesets)
@@ -246,9 +330,11 @@ def create_app(cfg: Settings, api=None) -> Starlette:
     async def ruleset_page(request: Request) -> Response:
         name = request.path_params["name"]
         rs = await db(store.get_ruleset, name)
-        if rs is None:
-            return page(request, "Not found", P.message("That rule set doesn't exist."), "rulesets", 404)
         rows = [r for r in await portal.role_rows() if r.ruleset == name]
+        if rs is None:
+            if R.NAME_RE.match(name):
+                return page(request, name, P.ruleset_missing(name, rows), "rulesets")
+            return page(request, "Not found", P.message("That rule set doesn't exist."), "rulesets", 404)
         edit = request.query_params.get("edit")
         edit_i = int(edit) if edit and edit.isdigit() and int(edit) < len(rs["draft"]["rules"]) else None
         return page(request, name, P.ruleset_editor(rs, rows, edit_i, request.session.pop("form_errors", None)),
@@ -393,7 +479,12 @@ def create_app(cfg: Settings, api=None) -> Starlette:
         Route("/login", login), Route("/auth/google", google_start), Route("/auth/google/callback", google_callback),
         Route("/auth/dev", dev_login, methods=["POST"]), Route("/logout", logout, methods=["POST"]),
         Route("/roles", protected(roles_page)),
+        Route("/roles/new", protected(role_new), methods=["GET", "POST"]),
+        Route("/roles/edit", protected(role_pick)),
+        Route("/roles/delete", protected(role_pick)),
         Route("/roles/{tid:int}", protected(role_page)),
+        Route("/roles/{tid:int}/edit", protected(role_edit), methods=["GET", "POST"]),
+        Route("/roles/{tid:int}/delete", protected(role_delete), methods=["GET", "POST"]),
         Route("/roles/{tid:int}/link", protected(link_review)),
         Route("/roles/{tid:int}/{action}", protected(role_action), methods=["POST"]),
         Route("/rulesets", protected(rulesets_page)),

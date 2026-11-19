@@ -80,6 +80,8 @@ class MockCvcue:
     def __init__(self) -> None:
         self.roles = seed_roles()
         self.puts: list[dict] = []
+        self.references = {7: [{"templateName": "IoT-A"}]}   # role profile used by an SSID profile
+        self._next_id = 20
 
     async def aclose(self) -> None:
         return None
@@ -87,6 +89,15 @@ class MockCvcue:
     async def get(self, path: str, params: dict | None = None, **_: Any) -> Any:
         if path == "/deviceconfiguration/roleprofiles":
             return copy.deepcopy(list(self.roles.values()))
+        if path == "/deviceconfiguration/roleprofiles/-2":
+            default = _role(-2, "System Default Role Profile", "System Default Role Profile", 0, None)
+            default.update({"vlanEnabled": False, "perUserTrafficControlEnabled": True, "role": "",
+                            "createdAtLocationId": {"type": "locallocationid", "id": 0}})
+            return default
+        if path.endswith("/references"):
+            tid = int(path.split("/")[-2])
+            return {"ssidHelperReference": copy.deepcopy(self.references.get(tid, [])),
+                    "wapPortProfileHelperReference": []}
         if path.startswith("/deviceconfiguration/roleprofiles/"):
             tid = int(path.rsplit("/", 1)[1])
             if tid not in self.roles:
@@ -94,9 +105,14 @@ class MockCvcue:
             return copy.deepcopy(self.roles[tid])
         if path == "/locations/tree":
             return {"rootLocationId": {"type": "locallocationid", "id": 0}, "locations": {
-                '{"type":"locallocationid","id":0}': {"name": "Arista Cognitive WiFi", "parentId": None},
+                '{"type":"locallocationid","id":0}': {"name": "Arista Cognitive WiFi", "parentId": None,
+                                                      "type": "folderlocation"},
                 '{"type":"locallocationid","id":3}': {"name": "Sharan's Home",
-                                                      "parentId": {"type": "locallocationid", "id": 0}},
+                                                      "parentId": {"type": "locallocationid", "id": 0},
+                                                      "type": "folderlocation"},
+                '{"type":"locallocationid","id":4}': {"name": "Basement",
+                                                      "parentId": {"type": "locallocationid", "id": 3},
+                                                      "type": "floorlocation"},
             }}
         raise CvcueError(404, "GET", path, "mock does not serve this path")
 
@@ -112,3 +128,28 @@ class MockCvcue:
         self.roles[tid] = body
         self.puts.append(body)
         return copy.deepcopy(body)
+
+    async def post(self, path: str, params: dict | None = None, json: Any = None, **_: Any) -> Any:
+        if path != "/deviceconfiguration/roleprofiles" or not isinstance(json, dict):
+            raise CvcueError(400, "POST", path, "mock only accepts role profile creation")
+        if any(r["templateName"] == json.get("templateName") for r in self.roles.values()):
+            raise CvcueError(400, "POST", path, '{"errors":[{"errorCode":"DUPLICATE_NAME"}]}')
+        self._next_id += 1
+        body = copy.deepcopy(json)
+        body["templateId"] = self._next_id
+        profile = []
+        for e in body.get("firewallProfile") or []:
+            e = {**e, "oid": next(_oid), "mncOid": 0, "ssid": self._next_id}
+            if not e.get("defaultRule"):
+                e["orderId"] = (e.get("orderId") or 0) + 1      # CV-CUE renumbers 1-based on create
+            profile.append(e)
+        body["firewallProfile"] = profile
+        self.roles[self._next_id] = body
+        return copy.deepcopy(body)
+
+    async def delete(self, path: str, params: dict | None = None, **_: Any) -> Any:
+        tid = int(path.rsplit("/", 1)[1])
+        if tid not in self.roles:
+            raise CvcueError(404, "DELETE", path, "not found")
+        del self.roles[tid]
+        return None

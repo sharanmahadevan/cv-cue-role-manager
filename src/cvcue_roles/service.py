@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from . import roleform as F
 from . import rules as R
 from .store import Store
 
@@ -30,6 +31,8 @@ ROLES_PATH = "/deviceconfiguration/roleprofiles"
 class Api(Protocol):
     async def get(self, path: str, **kw: Any) -> Any: ...
     async def put(self, path: str, **kw: Any) -> Any: ...
+    async def post(self, path: str, **kw: Any) -> Any: ...
+    async def delete(self, path: str, **kw: Any) -> Any: ...
 
 
 class StalePlan(Exception):
@@ -94,6 +97,7 @@ class Portal:
         self.store = store
         self.root = root_location
         self._loc_cache: tuple[float, dict] = (0.0, {})
+        self.location_types: dict = {}
         self._write_lock = asyncio.Lock()   # one publish at a time
 
     async def _db(self, fn, *args):
@@ -112,6 +116,7 @@ class Portal:
         raw = {_loc_id(k): v for k, v in ((tree or {}).get("locations") or {}).items()}
         names = {k: v.get("name", "") for k, v in raw.items()}
         parents = {k: _loc_id(v.get("parentId")) for k, v in raw.items()}
+        self.location_types = {k: v.get("type") for k, v in raw.items()}
         paths = {}
         for lid in raw:
             parts, cur, seen = [], lid, set()
@@ -281,3 +286,110 @@ class Portal:
     async def role_content(self, template_id: int, location_id: Any) -> tuple[dict, dict]:
         role = await self.get_role(template_id, location_id)
         return role, R.from_role(role) or R.empty_content()
+
+    # ------------------------------------------------------------ create / edit / delete role profiles
+    async def folder_locations(self) -> dict:
+        """Locations a role profile can be created at (folders), id -> path."""
+        paths = await self.locations()
+        folders = {k: v for k, v in paths.items()
+                   if (self.location_types.get(k) or "").lower() in ("folder", "folderlocation", "")}
+        return dict(sorted((folders or paths).items(), key=lambda kv: kv[1]))
+
+    async def references(self, template_id: int, location_id: Any) -> list[str]:
+        """Names of SSID profiles and port profiles that use this role profile."""
+        refs = await self.api.get(f"{ROLES_PATH}/{template_id}/references", params={"locationid": location_id})
+        out = []
+        for key in ("ssidHelperReference", "wapPortProfileHelperReference"):
+            for r in (refs or {}).get(key) or []:
+                out.append(str(r.get("templateName") or r.get("name") or r.get("ssid") or r))
+        return out
+
+    async def _ruleset_content(self, name: str | None) -> dict | None:
+        if not name:
+            return None
+        versions = await self._db(self.store.versions, name)
+        if not versions:
+            raise ValueError(f"{name} has no published version.")
+        return versions[0]
+
+    async def create_role(self, f: dict, user: str) -> int:
+        async with self._write_lock:
+            loc = int(f["location"])
+            version = await self._ruleset_content(f.get("ruleset"))
+            base = await self.api.get(f"{ROLES_PATH}/-2", params={"locationid": loc})
+            body = F.apply(json.loads(json.dumps(base)), f, creating=True)
+            if version:
+                body = R.apply_to_role(body, version["content"])
+            else:
+                body["firewallEnabled"], body["firewallProfile"] = False, []
+            run_id = await self._db(self.store.start_run, "create", f.get("ruleset") or "-",
+                                    version["version"] if version else None, user)
+            tid, good, msg = None, False, ""
+            try:
+                created = await self.api.post(ROLES_PATH, params={"locationid": loc}, json=body)
+                tid = (created or {}).get("templateId")
+                if tid is None:
+                    match = [r for r in await self.raw_roles() if r.get("templateName") == f["name"]]
+                    tid = match[0]["templateId"] if match else None
+                if tid is None:
+                    msg = "CV-CUE accepted the request, but the new role profile wasn't found."
+                else:
+                    saved = await self.get_role(tid, loc)
+                    problems = F.check(saved, f)
+                    if version and R.fingerprint(R.from_role(saved)) != R.fingerprint(version["content"]):
+                        problems.append("firewall rules")
+                    good = not problems
+                    msg = "Created and verified" if good else "Created, but these didn't match: " + ", ".join(problems)
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+            await self._db(self.store.add_result, run_id, tid or 0, f["name"], loc, good, msg)
+            await self._db(self.store.finish_run, run_id, f"Created {f['name']}" if tid else "Create failed")
+            return run_id
+
+    async def update_role(self, template_id: int, location_id: Any, f: dict, user: str) -> int:
+        async with self._write_lock:
+            role = await self.get_role(template_id, location_id)
+            old_tags = R.tags_of(role)
+            old = old_tags[0] if old_tags else ""
+            new = f.get("ruleset") or ""
+            version = await self._ruleset_content(new) if new and new != old else None
+            body = F.apply(json.loads(json.dumps(role)), f, creating=False)
+            if version:
+                body = R.apply_to_role(body, version["content"])
+            run_id = await self._db(self.store.start_run, "edit", new or old or "-",
+                                    version["version"] if version else None, user)
+            try:
+                await self.api.put(ROLES_PATH, params={"locationid": location_id}, json=body)
+                saved = await self.get_role(template_id, location_id)
+                problems = F.check(saved, f)
+                if version and R.fingerprint(R.from_role(saved)) != R.fingerprint(version["content"]):
+                    problems.append("firewall rules")
+                if not version and R.fingerprint(R.from_role(saved)) != R.fingerprint(R.from_role(role)):
+                    problems.append("firewall rules changed unexpectedly")
+                good = not problems
+                msg = "Saved and verified" if good else "Saved, but these didn't match: " + ", ".join(problems)
+            except Exception as exc:  # noqa: BLE001
+                good, msg = False, str(exc)
+            await self._db(self.store.add_result, run_id, template_id, f["name"], location_id, good, msg)
+            await self._db(self.store.finish_run, run_id, f"Edited {f['name']}" if good else "Edit failed")
+            return run_id
+
+    async def delete_role(self, template_id: int, location_id: Any, user: str) -> int:
+        async with self._write_lock:
+            role = await self.get_role(template_id, location_id)
+            refs = await self.references(template_id, location_id)
+            if refs:
+                raise ValueError("This role profile is used by " + ", ".join(refs) + ". Remove it there first.")
+            tags = R.tags_of(role)
+            run_id = await self._db(self.store.start_run, "delete", tags[0] if tags else "-", None, user)
+            try:
+                await self.api.delete(f"{ROLES_PATH}/{template_id}", params={"locationid": location_id})
+                still = [r for r in await self.raw_roles() if r.get("templateId") == template_id]
+                good = not still
+                msg = "Deleted" if good else "CV-CUE accepted the request, but the role profile is still listed."
+            except Exception as exc:  # noqa: BLE001
+                good, msg = False, str(exc)
+            await self._db(self.store.add_result, run_id, template_id, role["templateName"], location_id, good, msg)
+            await self._db(self.store.finish_run, run_id,
+                           f"Deleted {role['templateName']}" if good else "Delete failed")
+            return run_id

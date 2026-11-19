@@ -52,6 +52,9 @@ label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--mute
 .plus{color:var(--ok)}.minus{color:var(--bad)}.tilde{color:var(--warn)}
 .flash{padding:10px 14px;border-radius:8px;margin-bottom:16px}.errors{color:var(--bad);margin:0 0 8px;padding-left:18px}
 details summary{cursor:pointer;color:var(--accent)}.mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+tr.pick{cursor:pointer}tr.pick:hover td{background:var(--neutral)}tr.sel td{background:var(--accent-bg)}
+input[type=radio]{accent-color:var(--accent);width:16px;height:16px;padding:0}fieldset label{margin:0}
+.danger-fill{background:var(--bad);border-color:var(--bad);color:#fff}.danger-fill:hover{background:var(--bad)}
 .tag{font-size:11px;background:var(--neutral);color:var(--muted);padding:1px 7px;border-radius:6px}
 """
 
@@ -124,6 +127,16 @@ def role_link(row) -> str:
 
 
 # ------------------------------------------------------------ role profiles
+def vlan_label(role: dict) -> str:
+    if not role.get("vlanEnabled"):
+        return "From SSID"
+    return esc(role.get("vlanId")) if role.get("vlanId") else "Untagged"
+
+
+def ruleset_link(name: str | None) -> str:
+    return f'<a href="/rulesets/{esc(name)}">{esc(name)}</a>' if name else '<span class="none">None</span>'
+
+
 def roles(rows, sets) -> str:
     pending = [s for s in sets if s["has_changes"]]
     banner = "".join(f'<div class="flash pend"><b>{esc(s["name"])}</b> has unpublished changes. '
@@ -131,17 +144,123 @@ def roles(rows, sets) -> str:
     trs = []
     for r in rows:
         role = r.role
-        rs = (f'<a href="/rulesets/{esc(r.ruleset)}">{esc(r.ruleset)}</a>' if r.ruleset
-              else '<span class="none">None</span>')
-        vlan = role.get("vlanId") if role.get("vlanEnabled") else None
-        trs.append(f'<tr><td>{role_link(r)}</td><td>{esc(r.location)}</td><td>{rs}</td>'
-                   f'<td>{"untagged" if not vlan else esc(vlan)}</td>'
-                   f'<td>{"On" if role.get("firewallEnabled") else "Off"}</td><td>{status_pill(r)}</td></tr>')
+        rid = f"sel-{r.template_id}"
+        trs.append(f'<tr class="pick"><td class="n"><input type="radio" name="sel" id="{rid}" '
+                   f'value="{r.template_id}:{esc(r.location_id)}" aria-label="Select {esc(role.get("templateName"))}"></td>'
+                   f'<td>{role_link(r)}</td><td>{esc(r.location)}</td><td>{ruleset_link(r.ruleset)}</td>'
+                   f'<td>{vlan_label(role)}</td><td>{"On" if role.get("firewallEnabled") else "Off"}</td>'
+                   f'<td>{status_pill(r)}</td></tr>')
     managed = sum(1 for r in rows if r.ruleset)
+    toolbar = ('<div class="row" style="margin-bottom:10px"><a class="btn primary" href="/roles/new">Add role profile</a>'
+               '<button formaction="/roles/edit">Edit</button><button formaction="/roles/delete" class="danger">Delete</button>'
+               '<span class="sub" style="margin:0" id="selhint">Select a role profile to edit or delete it.</span></div>')
+    script = ('<script>document.querySelectorAll("tr.pick").forEach(function(tr){tr.addEventListener("click",function(e){'
+              'if(e.target.closest("a,button,input"))return;var r=tr.querySelector("input[type=radio]");r.checked=true;'
+              'r.dispatchEvent(new Event("change",{bubbles:true}));});});document.getElementById("rolesForm")'
+              '.addEventListener("change",function(){var c=document.querySelector("input[name=sel]:checked");'
+              'document.querySelectorAll("tr.pick").forEach(function(tr){tr.classList.toggle("sel",tr.contains(c));});'
+              'document.getElementById("selhint").textContent=c?"Selected: "+c.closest("tr").querySelector("a").textContent:"";});'
+              '</script>')
     return (f'<h1>Network profiles · Roles</h1><p class="sub">{len(rows)} role profiles, {managed} linked to a rule set. '
             'Link a role profile to a rule set to manage its firewall rules from here.</p>' + banner +
-            '<div class="card tw"><table><tr><th>Role profile</th><th>Location</th><th>Firewall rule set</th>'
-            '<th>VLAN</th><th>Firewall</th><th>Sync status</th></tr>' + "".join(trs) + "</table></div>")
+            '<form method="get" id="rolesForm" class="card tw">' + toolbar +
+            '<table><tr><th></th><th>Role profile</th><th>Location</th><th>Firewall rule set</th>'
+            '<th>VLAN</th><th>Firewall</th><th>Sync status</th></tr>' + "".join(trs) + "</table></form>" + script)
+
+
+def role_form(mode: str, f: dict, errors: list[str], locations: dict, sets: list[dict], current_ruleset: str = "",
+              tid: int | None = None, loc=None) -> str:
+    v = f.get
+    creating = mode == "create"
+    errs = "".join(f"<li>{esc(e)}</li>" for e in errors)
+    published = [s for s in sets if s["latest"]]
+
+    def sel(field, value, default=""):
+        return "selected" if (v(field) or default) == value else ""
+
+    rs_opts = ['<option value="">None (manage firewall rules in CV-CUE)</option>']
+    names = {s["name"] for s in published}
+    for s in published:
+        rs_opts.append(f'<option value="{esc(s["name"])}" {sel("ruleset", s["name"])}>{esc(s["name"])} (v{s["latest"]})</option>')
+    if current_ruleset and current_ruleset not in names:
+        rs_opts.append(f'<option value="{esc(current_ruleset)}" {sel("ruleset", current_ruleset)}>'
+                       f'{esc(current_ruleset)} (keep tag; not set up in this app)</option>')
+    loc_field = ""
+    if creating:
+        opts = "".join(f'<option value="{k}" {sel("location", str(k))}>{esc(p)}</option>' for k, p in locations.items())
+        loc_field = f'<label>Location<select name="location" required>{opts}</select></label>'
+    else:
+        loc_field = f'<label>Location<input value="{esc(locations.get(loc, loc))}" disabled></label>'
+    unit = lambda key: (f'<select name="{key}_unit" aria-label="Unit"><option value="1" {sel(key + "_unit", "1")}>Mbps</option>'  # noqa: E731
+                        f'<option value="0" {sel(key + "_unit", "0", "1")}>Kbps</option></select>')
+    action = "/roles/new" if creating else f"/roles/{tid}/edit"
+    crumb = ("Add role profile" if creating else
+             f'<a href="/roles/{tid}?loc={esc(loc)}">{esc(f.get("orig_name") or v("name"))}</a> / Edit')
+    rs_note = ("Choosing a rule set applies its latest published version and tags the role profile. "
+               "Choosing None removes the tag and leaves the current firewall rules as they are.")
+    return (f'<div class="crumb"><a href="/roles">Role profiles</a> / {crumb}</div>'
+            f'<h1>{"Add role profile" if creating else "Edit role profile"}</h1>'
+            '<p class="sub">Saved straight to CV-CUE, then read back to check.</p>'
+            + (f'<ul class="errors flash bad">{errs}</ul>' if errs else "") +
+            f'<form method="post" action="{action}" class="card">{CSRF}'
+            + ("" if creating else f'<input type="hidden" name="loc" value="{esc(loc)}">') +
+            '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr))">'
+            f'<label>Role name<input name="name" value="{esc(v("name"))}" required maxlength="64" placeholder="Staff"></label>'
+            f'{loc_field}'
+            f'<label style="grid-column:1/-1">Description<input name="description" value="{esc(v("description"))}" maxlength="200" '
+            'placeholder="Who gets this role"></label>'
+            '<label>VLAN<select name="vlan_mode">'
+            f'<option value="ssid" {sel("vlan_mode", "ssid", "ssid")}>Use the SSID\'s VLAN</option>'
+            f'<option value="untagged" {sel("vlan_mode", "untagged")}>Untagged</option>'
+            f'<option value="id" {sel("vlan_mode", "id")}>VLAN ID</option></select></label>'
+            f'<label>VLAN ID<input name="vlan_id" value="{esc(v("vlan_id"))}" inputmode="numeric" placeholder="20"></label>'
+            f'<label style="grid-column:1/-1">Firewall rule set<select name="ruleset">{"".join(rs_opts)}</select>'
+            f'<span>{rs_note}</span></label>'
+            '<fieldset style="grid-column:1/-1;border:1px solid var(--border);border-radius:8px;padding:10px 12px">'
+            '<legend style="font-size:12px;color:var(--muted)">Per-user traffic control</legend>'
+            f'<label style="flex-direction:row;align-items:center;gap:8px;color:var(--text)"><input type="checkbox" name="tc_enabled" '
+            f'value="1" {"checked" if v("tc_enabled") else ""}> Limit each client\'s bandwidth</label>'
+            '<div class="row" style="margin-top:8px">'
+            f'<label>Download<span class="row"><input name="down" value="{esc(v("down"))}" size="7" inputmode="numeric">{unit("down")}</span></label>'
+            f'<label>Upload<span class="row"><input name="up" value="{esc(v("up"))}" size="7" inputmode="numeric">{unit("up")}</span></label>'
+            '</div></fieldset></div>'
+            f'<div class="row" style="margin-top:16px"><button class="primary">{"Create role profile" if creating else "Save changes"}</button>'
+            f'<a class="btn" href="{"/roles" if creating else f"/roles/{tid}?loc={esc(loc)}"}">Cancel</a></div></form>')
+
+
+def role_delete(row, refs: list[str]) -> str:
+    role = row.role
+    tid, loc = row.template_id, row.location_id
+    name = esc(role.get("templateName"))
+    if refs:
+        body = (f'<p>{name} can\'t be deleted while these profiles use it: <b>{esc(", ".join(refs))}</b>. '
+                'Remove it from them in CV-CUE first.</p>'
+                f'<a class="btn" href="/roles/{tid}?loc={esc(loc)}">Back</a>')
+    else:
+        body = (f'<p>This permanently deletes the role profile <b>{name}</b> from CV-CUE at {esc(row.location)}. '
+                'It can\'t be undone here; you\'d have to create it again.</p>'
+                + (f'<p class="sub">It\'s linked to {esc(row.ruleset)}; the rule set itself is kept.</p>' if row.ruleset else "")
+                + f'<form method="post" action="/roles/{tid}/delete" class="row">{CSRF}'
+                f'<input type="hidden" name="loc" value="{esc(loc)}"><button class="primary danger-fill">Delete {name}</button>'
+                f'<a class="btn" href="/roles/{tid}?loc={esc(loc)}">Cancel</a></form>')
+    return (f'<div class="crumb"><a href="/roles">Role profiles</a> / <a href="/roles/{tid}?loc={esc(loc)}">{name}</a> / Delete</div>'
+            f'<h1>Delete {name}?</h1><div class="card">{body}</div>')
+
+
+def ruleset_missing(name: str, linked) -> str:
+    sources = "".join(f'<option value="role:{r.template_id}:{esc(r.location_id)}">Copy current rules from '
+                      f'{esc(r.role["templateName"])}</option>' for r in linked if r.role.get("firewallEnabled"))
+    used = ", ".join(role_link(r) for r in linked) or "none"
+    return (f'<div class="crumb"><a href="/rulesets">Rule sets</a> / {esc(name)}</div>'
+            f'<h1>{esc(name)} isn\'t set up in this app yet</h1>'
+            f'<p class="sub">These role profiles are tagged <span class="mono">ruleset:{esc(name)}</span> in CV-CUE: {used}. '
+            'Create the rule set here to manage them. Starting from a linked role profile\'s current rules means '
+            'publishing it changes nothing on CV-CUE.</p>'
+            f'<form method="post" action="/rulesets" class="card row" style="align-items:flex-end">{CSRF}'
+            f'<input type="hidden" name="name" value="{esc(name)}">'
+            f'<label>Start from<select name="source">{sources}<option value="">Empty</option></select></label>'
+            f'<label style="flex:1;min-width:220px">Description<input name="description" placeholder="What this rule set allows"></label>'
+            f'<button class="primary">Create {esc(name)}</button></form>')
 
 
 def rules_table(content: dict, compare: dict | None = None, editable: bool = False, name: str = "",
@@ -186,11 +305,10 @@ def role_detail(row, current, sets, latest, changes) -> str:
     role = row.role
     tid, loc = row.template_id, row.location_id
     hidden = f'{CSRF}<input type="hidden" name="loc" value="{esc(loc)}">'
-    vlan = role.get("vlanId") if role.get("vlanEnabled") else None
-    rs_link = f'<a href="/rulesets/{esc(row.ruleset)}">{esc(row.ruleset)}</a>' if row.ruleset else "None"
+    rs_link = ruleset_link(row.ruleset)
     info = (f'<div class="grid" style="margin-bottom:16px">'
             f'<div class="stat"><div class="l">Location</div>{esc(row.location)}</div>'
-            f'<div class="stat"><div class="l">VLAN</div>{"untagged" if not vlan else esc(vlan)}</div>'
+            f'<div class="stat"><div class="l">VLAN</div>{vlan_label(role)}</div>'
             f'<div class="stat"><div class="l">Firewall</div>{"On" if role.get("firewallEnabled") else "Off"}</div>'
             f'<div class="stat"><div class="l">Firewall rule set</div>'
             f'{rs_link}</div>'
@@ -228,8 +346,11 @@ def role_detail(row, current, sets, latest, changes) -> str:
                       '<button>Create rule set from these rules</button></form>')
     if not published and not row.ruleset:
         manage.append('<p class="sub">Publish a rule set first, then link this role profile to it.</p>')
+    head_buttons = (f'<div class="row"><a class="btn primary" href="/roles/{tid}/edit?loc={esc(loc)}">Edit role profile</a>'
+                    f'<a class="btn danger" href="/roles/{tid}/delete?loc={esc(loc)}">Delete</a></div>')
     return (f'<div class="crumb"><a href="/roles">Role profiles</a> / {esc(role.get("templateName"))}</div>'
-            f'<h1>{esc(role.get("templateName"))}</h1><p class="sub">{esc(role.get("description")) or "No description"}</p>'
+            f'<div class="row" style="justify-content:space-between"><h1>{esc(role.get("templateName"))}</h1>{head_buttons}</div>'
+            f'<p class="sub">{esc(role.get("description")) or "No description"}</p>'
             + info + "".join(actions) +
             f'<div class="card"><h2>Firewall rules on CV-CUE</h2>'
             f'{rules_table(current) if role.get("firewallEnabled") else "<p>Firewall is off for this role profile.</p>"}</div>'

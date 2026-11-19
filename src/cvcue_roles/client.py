@@ -95,6 +95,12 @@ class CvcueClient:
     async def put(self, path: str, **kw: Any) -> Any:
         return await self.request("PUT", path, **kw)
 
+    async def post(self, path: str, **kw: Any) -> Any:
+        return await self.request("POST", path, **kw)
+
+    async def delete(self, path: str, **kw: Any) -> Any:
+        return await self.request("DELETE", path, **kw)
+
 
 def _param(v: Any) -> Any:
     if isinstance(v, bool):
