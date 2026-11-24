@@ -45,6 +45,12 @@ CREATE TABLE IF NOT EXISTS results (
     ok          INTEGER NOT NULL,
     message     TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS applied (
+    template_id INTEGER PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    rulesets    TEXT NOT NULL,
+    applied_at  REAL NOT NULL
+);
 """
 
 
@@ -151,3 +157,12 @@ class Store:
             sql += "WHERE ruleset = ? "
             args = (ruleset,)
         return [dict(r) for r in self._q(sql + "ORDER BY id DESC LIMIT ?", (*args, limit))]
+
+    # ---------------------------------------------------------- what was last pushed to each role profile
+    def record_applied(self, template_id: int, fingerprint: str, rulesets: dict) -> None:
+        """Remember the combined rules last pushed, so an older combination reads as "update pending"."""
+        self._x("INSERT OR REPLACE INTO applied VALUES (?, ?, ?, ?)",
+                (template_id, fingerprint, json.dumps(rulesets), time.time()))
+
+    def applied_fingerprints(self) -> dict[int, str]:
+        return {r["template_id"]: r["fingerprint"] for r in self._q("SELECT template_id, fingerprint FROM applied")}

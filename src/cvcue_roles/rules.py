@@ -103,16 +103,39 @@ def apply_to_role(role: dict, content: dict) -> dict:
 
 # ------------------------------------------------------------ tags
 def tags_of(role: dict) -> list[str]:
-    return TAG_RE.findall(role.get("description") or "")
+    """Linked rule set names, in the order they're applied (duplicates dropped)."""
+    out: list[str] = []
+    for name in TAG_RE.findall(role.get("description") or ""):
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def set_tags(description: str | None, names: list[str] | None) -> str:
+    """Description with its ruleset tags replaced by `names`, in order (all removed when empty)."""
+    text = TAG_RE.sub("", description or "").strip()
+    text = re.sub(r"\s{2,}", " ", text)
+    for name in names or []:
+        text = f"{text} ruleset:{name}".strip()
+    return text
 
 
 def set_tag(description: str | None, name: str | None) -> str:
-    """Description with its ruleset tag replaced (or removed when name is None)."""
-    text = TAG_RE.sub("", description or "").strip()
-    text = re.sub(r"\s{2,}", " ", text)
-    if name:
-        text = f"{text} ruleset:{name}".strip()
-    return text
+    """Description linked to a single rule set (or none)."""
+    return set_tags(description, [name] if name else [])
+
+
+def compose(contents: list[dict]) -> dict:
+    """Combine rule sets in order: their rules one after another, then one default rule.
+
+    The default rule blocks if any of the rule sets blocks by default, so adding a rule set
+    never opens up traffic that another one denies.
+    """
+    contents = [normalize(c) for c in contents]
+    if not contents:
+        return empty_content()
+    return {"rules": [r for c in contents for r in c["rules"]],
+            "default_action": 2 if any(c["default_action"] == 2 for c in contents) else 1}
 
 
 # ------------------------------------------------------------ display and diff

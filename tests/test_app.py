@@ -74,14 +74,14 @@ def test_edit_review_publish(client):
 def test_role_page_revert_and_link(client):
     c, api = client
     page = c.get("/roles/7?loc=3").text
-    assert "Out of sync with iot-lockdown v1" in page and "Allow-Any-TCP" in page
+    assert "Out of sync with iot-lockdown" in page and "Allow-Any-TCP" in page
     token = csrf_of(page)
     r = c.post("/roles/7/revert", data={"csrf": token, "loc": "3"})
-    assert "Reverted Test to v1" in r.text
+    assert "Reverted Test to the latest iot-lockdown" in r.text
     link = c.get("/roles/10/link?loc=3&ruleset=basic-web").text
     assert "firewall: off → on" in link
     r = c.post("/roles/10/link", data={"csrf": token, "loc": "3", "ruleset": "basic-web"})
-    assert "Linked Guest to v1" in r.text and api.roles[10]["description"].endswith("ruleset:basic-web")
+    assert "Linked Guest to basic-web" in r.text and api.roles[10]["description"].endswith("ruleset:basic-web")
 
 
 def test_create_from_role_and_export(client):
@@ -110,3 +110,11 @@ def test_rule_form_fields_follow_protocol(client):
     assert (rules[-1]["protocol"], rules[-1]["port"], rules[-1]["direction"]) == (50, "", 0)
     edit = c.get(f"/rulesets/basic-web?edit={len(rules) - 1}").text
     assert '<option value="other" selected>Other</option>' in edit and 'value="47"' in edit
+
+
+def test_public_url_follows_fly_app_name(monkeypatch):
+    monkeypatch.delenv("PUBLIC_URL", raising=False)
+    monkeypatch.setenv("FLY_APP_NAME", "acme-roles")
+    assert Settings.from_env().public_url == "https://acme-roles.fly.dev"
+    monkeypatch.setenv("PUBLIC_URL", "https://roles.acme.com/")
+    assert Settings.from_env().public_url == "https://roles.acme.com"

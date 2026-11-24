@@ -23,8 +23,11 @@ def setup(tmp_path):
 
 
 def form(**kw):
+    if "ruleset" in kw:                       # shorthand for a single rule set
+        one = kw.pop("ruleset")
+        kw["rulesets"] = [one] if one else []
     base = {"role_name": "Staff", "profile_name": "Staff", "description": "Employees", "vlan_on": "1",
-            "vlan_type": "id", "vlan_id": "40", "fw_on": "1", "ruleset": "basic-web", "location": "3"}
+            "vlan_type": "id", "vlan_id": "40", "fw_on": "1", "rulesets": ["basic-web"], "location": "3"}
     return {k: v for k, v in {**base, **kw}.items() if v is not None}
 
 
@@ -43,7 +46,7 @@ def test_parse_validation():
     _, errs = parse(ruleset="")
     assert errs == ["Pick a firewall rule set, create a new one, or turn off Layer 3-4 firewall rules."]
     f, errs = parse(ruleset="", fw_on=None)
-    assert not errs and f["ruleset"] == ""
+    assert not errs and f["rulesets"] == []
     f, errs = parse(description="hi ruleset:sneaky")
     assert not errs and f["description"] == "hi"          # tags come only from the rule set field
     _, errs = parse(vlan_type="pool", vlan_pool="1,2,6-23")
@@ -53,7 +56,7 @@ def test_parse_validation():
     _, errs = parse(vlan_type="name", vlan_name="Staff VLAN")
     assert errs and "VLAN name" in errs[0]
     f, errs = parse(ruleset=F.NEW_RULESET)
-    assert not errs and f["ruleset"] == F.NEW_RULESET
+    assert not errs and f["rulesets"] == [F.NEW_RULESET]
 
 
 def test_apply_maps_cvcue_fields():
@@ -71,7 +74,7 @@ def test_apply_maps_cvcue_fields():
 def test_fields_round_trip_from_role(setup):
     _, api, _ = setup
     f = F.fields_from_role(api.roles[9])
-    assert f["ruleset"] == "basic-web" and f["description"] == "Demo B"
+    assert f["rulesets"] == ["basic-web"] and f["description"] == "Demo B"
     assert f["vlan_on"] == "1" and f["vlan_type"] == "id" and f["vlan_id"] == "20" and f["fw_on"] == "1"
 
 
@@ -102,8 +105,8 @@ async def test_edit_keep_current_rules_unlinks(setup):
     portal, api, store = setup
     before = R.from_role(api.roles[9])
     f = F.fields_from_role(api.roles[9])
-    f.update(profile_name="Demo-Sync-B2", vlan_id="25", ruleset="")
-    f, errs = F.parse(f, existing_names=set(), published={"basic-web"}, current_ruleset="basic-web",
+    f.update(profile_name="Demo-Sync-B2", vlan_id="25", rulesets=[])
+    f, errs = F.parse(f, existing_names=set(), published={"basic-web"}, current_rulesets=["basic-web"],
                       creating=False, keep_allowed=True)
     assert not errs
     run = store.get_run(await portal.update_role(9, 3, f, "me"))
@@ -116,12 +119,12 @@ async def test_edit_keep_current_rules_unlinks(setup):
 async def test_edit_links_new_ruleset_and_turns_firewall_off(setup):
     portal, api, store = setup
     f = F.fields_from_role(api.roles[10])
-    f.update(fw_on="1", ruleset="iot-lockdown")
+    f.update(fw_on="1", rulesets=["iot-lockdown"])
     run = store.get_run(await portal.update_role(10, 3, f, "me"))
     assert run["results"][0]["ok"] == 1
     assert R.tags_of(api.roles[10]) == ["iot-lockdown"] and api.roles[10]["firewallEnabled"]
     f = F.fields_from_role(api.roles[10])
-    f.update(fw_on="", ruleset="")
+    f.update(fw_on="", rulesets=[])
     run = store.get_run(await portal.update_role(10, 3, f, "me"))
     assert run["results"][0]["ok"] == 1, run
     assert not api.roles[10]["firewallEnabled"] and not R.tags_of(api.roles[10])
@@ -181,7 +184,7 @@ def test_create_edit_delete_pages(client):
     c, api = client
     token = csrf_of(c.get("/roles/new").text)
     data = {"csrf": token, "role_name": "contractors", "profile_name": "Contractors", "location": "3",
-            "vlan_on": "1", "vlan_type": "id", "vlan_id": "0", "fw_on": "1", "ruleset": "basic-web"}
+            "vlan_on": "1", "vlan_type": "id", "vlan_id": "0", "fw_on": "1", "rulesets": "basic-web"}
     bad = c.post("/roles/new", data={**data, "profile_name": ""})
     assert bad.status_code == 400 and "Enter a profile name" in bad.text
     ok = c.post("/roles/new", data=data)
@@ -189,11 +192,12 @@ def test_create_edit_delete_pages(client):
     new = [r for r in api.roles.values() if r["templateName"] == "Contractors"][0]
     assert new["role"] == "contractors"
     edit = c.get("/roles/9/edit?loc=3").text
-    assert 'value="Demo B"' in edit and 'value="20"' in edit and "Keep current rules" in edit
+    assert 'value="Demo B"' in edit and 'value="20"' in edit
+    assert "current rules without a rule set" in edit and '<option value="basic-web" selected>' in edit
     saved = c.post("/roles/9/edit", data={"csrf": token, "loc": "3", "role_name": "Demo-Sync-B",
                                           "profile_name": "Demo-Sync-B", "description": "Lab", "vlan_on": "1",
                                           "vlan_type": "id", "vlan_id": "21", "fw_on": "1",
-                                          "ruleset": "basic-web"})
+                                          "rulesets": "basic-web"})
     assert "Saved and verified" in saved.text and api.roles[9]["vlanId"] == 21
     assert api.roles[9]["description"] == "Lab ruleset:basic-web"
     confirm = c.get("/roles/7/delete?loc=3").text
@@ -207,7 +211,7 @@ def test_create_new_ruleset_from_role_form_and_return(client):
     token = csrf_of(c.get("/roles/new").text)
     data = {"csrf": token, "role_name": "printers", "profile_name": "Printers", "location": "3",
             "description": "Office printers", "vlan_on": "1", "vlan_type": "id", "vlan_id": "60", "fw_on": "1",
-            "ruleset": "__new__", "up_on": "1", "up": "2", "up_unit": "1"}
+            "rulesets": "__new__", "up_on": "1", "up": "2", "up_unit": "1"}
     r = c.post("/roles/new", data=data, follow_redirects=False)
     assert r.headers["location"] == "/rulesets/new"
     page = c.get("/rulesets/new").text
@@ -224,7 +228,7 @@ def test_create_new_ruleset_from_role_form_and_return(client):
     assert 'value="Printers"' in back and 'value="60"' in back and 'value="Office printers"' in back
     assert '<option value="printer-only" selected>' in back
     assert "Return to role profile" not in c.get("/rulesets/printer-only").text   # handoff finished
-    created = c.post("/roles/new", data={**data, "ruleset": "printer-only"})
+    created = c.post("/roles/new", data={**data, "rulesets": "printer-only"})
     assert "Created and verified" in created.text
     role = [r for r in api.roles.values() if r["templateName"] == "Printers"][0]
     assert [e["name"] for e in role["firewallProfile"]] == ["Allow-IPP", ""]
@@ -275,7 +279,7 @@ def test_edit_result_page_links_role_and_ruleset(client):
     token = csrf_of(c.get("/roles").text)
     html = c.post("/roles/9/edit", data={"csrf": token, "loc": "3", "role_name": "Demo-Sync-B",
                                          "profile_name": "Demo-Sync-B", "vlan_on": "1", "vlan_type": "id",
-                                         "vlan_id": "20", "fw_on": "1", "ruleset": "basic-web"}).text
+                                         "vlan_id": "20", "fw_on": "1", "rulesets": "basic-web"}).text
     assert 'href="/roles/9?loc=3">Open Demo-Sync-B' in html and 'href="/rulesets/basic-web">Open rule set' in html
 
 

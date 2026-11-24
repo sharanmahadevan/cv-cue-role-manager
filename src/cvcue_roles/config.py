@@ -82,7 +82,8 @@ class Settings:
             verify_ssl=_bool(e("CVCUE_VERIFY_SSL"), True),
             root_location=int(e("CVCUE_ROOT_LOCATION") or 0),
             mock=_bool(e("CVCUE_MOCK")) and not on_fly,
-            public_url=(e("PUBLIC_URL") or "http://localhost:8080").rstrip("/"),
+            public_url=(e("PUBLIC_URL") or (f"https://{e('FLY_APP_NAME')}.fly.dev" if on_fly
+                                             else f"http://localhost:{e('PORT') or 8080}")).rstrip("/"),
             db_path=e("DB_PATH") or "role-manager.db",
             session_secret=e("SESSION_SECRET") or secrets.token_urlsafe(32),
             google_client_id=e("GOOGLE_CLIENT_ID") or "",

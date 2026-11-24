@@ -12,7 +12,7 @@ primary_region = "sjc"
   dockerfile = "Dockerfile"
 
 [env]
-  PUBLIC_URL = "https://cv-cue-role-manager.fly.dev"
+  # PUBLIC_URL defaults to https://<app>.fly.dev; set it only for a custom domain.
   DB_PATH = "/data/role-manager.db"
   CVCUE_ROOT_LOCATION = "0"
   PORT = "8080"

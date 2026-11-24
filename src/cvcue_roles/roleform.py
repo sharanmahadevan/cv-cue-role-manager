@@ -61,7 +61,7 @@ def fields_from_role(role: dict) -> dict:
         "vlan_name": role.get("vlanName") or "",
         "vlan_pool": role.get("vlanPool") or "",
         "fw_on": "1" if role.get("firewallEnabled") else "",
-        "ruleset": tags[0] if tags else "",
+        "rulesets": tags,
         "up_on": "1" if tc and up else "",
         "up": from_kbps(up),
         "down_on": "1" if tc and down else "",
@@ -84,10 +84,20 @@ def _pool_ok(pool: str) -> bool:
     return True
 
 
-def parse(form: dict, *, existing_names: set[str], published: set[str], current_ruleset: str = "",
+def parse(form: dict, *, existing_names: set[str], published: set[str], current_rulesets: list[str] | None = None,
           creating: bool, locations: dict | None = None, keep_allowed: bool = False) -> tuple[dict, list[str]]:
-    """Validated values and a list of errors. `existing_names` (lower case) excludes the role being edited."""
-    f = {k: str(v).strip() for k, v in form.items() if k != "csrf"}
+    """Validated values and a list of errors. `existing_names` (lower case) excludes the role being edited.
+
+    `form["rulesets"]` is the ordered list of linked rule sets (a string is taken as one).
+    """
+    raw_sets = form.get("rulesets") or []
+    if isinstance(raw_sets, str):
+        raw_sets = [raw_sets]
+    f = {k: str(v).strip() for k, v in form.items() if k not in ("csrf", "rulesets")}
+    rulesets: list[str] = []
+    for name in (str(x).strip() for x in raw_sets):
+        if name and name not in rulesets:
+            rulesets.append(name)
     errors: list[str] = []
     for key, label in (("role_name", "Role name"), ("profile_name", "Profile name")):
         if not NAME_RE.match(f.get(key, "")):
@@ -115,15 +125,14 @@ def parse(form: dict, *, existing_names: set[str], published: set[str], current_
             if not value.isdigit() or not 1 <= int(value) <= MAX_MBPS:
                 errors.append(f"{label} limit must be a whole number from 1 to {MAX_MBPS} Mbps.")
 
-    rs = f.get("ruleset", "")
     if not f.get("fw_on"):
-        f["ruleset"] = ""
-    elif rs == NEW_RULESET:
-        pass                                   # handled by the caller: go create one
-    elif not rs and not keep_allowed:
+        rulesets = []
+    elif not rulesets and not keep_allowed:
         errors.append("Pick a firewall rule set, create a new one, or turn off Layer 3-4 firewall rules.")
-    elif rs and rs not in published and rs != current_ruleset:
-        errors.append(f"Rule set {rs} has no published version yet. Publish it first.")
+    for rs in rulesets:
+        if rs != NEW_RULESET and rs not in published and rs not in (current_rulesets or []):
+            errors.append(f"Rule set {rs} has no published version yet. Publish it first.")
+    f["rulesets"] = rulesets                   # may contain NEW_RULESET: the caller goes to create one
     if creating:
         loc = f.get("location", "")
         if not loc.lstrip("-").isdigit() or (locations is not None and int(loc) not in locations):
@@ -138,7 +147,7 @@ def apply(body: dict, f: dict, *, creating: bool) -> dict:
     """
     body["templateName"] = f["profile_name"]
     body["role"] = f["role_name"]
-    body["description"] = R.set_tag(f["description"], f.get("ruleset") or None)
+    body["description"] = R.set_tags(f["description"], [n for n in f.get("rulesets") or [] if n != NEW_RULESET])
     body["inheritFromSSID"] = bool(f.get("inherit"))
 
     on = bool(f.get("vlan_on"))
@@ -212,5 +221,6 @@ def summary(f: dict) -> list[tuple[str, Any]]:
         vlan = {"name": f"Name {f.get('vlan_name')}", "pool": f"Pool {f.get('vlan_pool')}"}.get(
             f.get("vlan_type"), "Untagged" if f.get("vlan_id") in ("", "0") else f"ID {f.get('vlan_id')}")
     return [("Role name", f["role_name"]), ("Profile name", f["profile_name"]), ("VLAN", vlan),
-            ("Firewall rule set", f.get("ruleset") or ("Off" if not f.get("fw_on") else "Keep current rules")),
+            ("Firewall rule sets", " + ".join(f.get("rulesets") or [])
+             or ("Off" if not f.get("fw_on") else "Keep current rules")),
             ("Upload", _limit(f, "up")), ("Download", _limit(f, "down"))]

@@ -162,6 +162,13 @@ def create_app(cfg: Settings, api=None) -> Starlette:
         sets = await db(store.list_rulesets)
         return page(request, "Roles", P.roles(rows, sets), "roles")
 
+    async def read_form(request: Request) -> dict:
+        """Form fields as a dict; `rulesets` (repeated, ordered) as a list."""
+        form = await request.form()
+        data = {k: v for k, v in form.items() if k != "rulesets"}
+        data["rulesets"] = [str(v) for v in form.getlist("rulesets")]
+        return data
+
     async def role_page(request: Request) -> Response:
         tid = int(request.path_params["tid"])
         loc = loc_param(request)
@@ -169,33 +176,38 @@ def create_app(cfg: Settings, api=None) -> Starlette:
         locs = await portal.locations()
         sets = await db(store.list_rulesets)
         versions = {s["name"]: await db(store.versions, s["name"]) for s in sets}
-        row = portal.classify(role, locs.get(loc, f"Location {loc}"), versions)
-        linked_versions = versions.get(row.ruleset or "") or []
-        latest = linked_versions[0] if linked_versions else None
-        changes = R.diff(R.from_role(role), latest["content"]) if latest and row.status != "in_sync" else []
-        return page(request, role["templateName"], P.role_detail(row, current, sets, latest, changes), "roles")
+        applied = await db(store.applied_fingerprints)
+        row = portal.classify(role, locs.get(loc, f"Location {loc}"), versions, applied.get(tid))
+        target = None
+        if row.rulesets and not row.missing:
+            target, _ = await portal.latest_contents(row.rulesets)
+        changes = R.diff(R.from_role(role), target) if target and row.status != "in_sync" else []
+        return page(request, role["templateName"], P.role_detail(row, current, sets, target, changes), "roles")
 
     async def link_review(request: Request) -> Response:
         tid = int(request.path_params["tid"])
         loc = loc_param(request)
-        name = request.query_params.get("ruleset", "")
-        versions = await db(store.versions, name)
-        if not versions:
-            flash(request, "error", f"Publish {name or 'a rule set'} before linking role profiles to it.")
+        names = []
+        for n in request.query_params.getlist("rulesets") + request.query_params.getlist("ruleset"):
+            if n and n not in names:
+                names.append(n)
+        content, missing = await portal.latest_contents(names)
+        if not names or missing:
+            flash(request, "error", f"Publish {', '.join(missing) or 'a rule set'} before linking role profiles to it.")
             return RedirectResponse(f"/roles/{tid}?loc={loc}", 303)
         role = await portal.get_role(tid, loc)
-        changes = R.diff(R.from_role(role), versions[0]["content"])
-        return page(request, "Link role profile", P.link_review(role, loc, name, versions[0], changes), "roles")
+        changes = R.diff(R.from_role(role), content)
+        return page(request, "Link role profile", P.link_review(role, loc, names, content, changes), "roles")
 
     async def role_action(request: Request) -> Response:
         tid = int(request.path_params["tid"])
         action = request.path_params["action"]
-        form = await request.form()
+        form = await read_form(request)
         loc = loc_param(request, form)
         user = user_of(request)
         try:
             if action == "link":
-                run_id = await portal.link(tid, loc, str(form.get("ruleset", "")), user)
+                run_id = await portal.link(tid, loc, form["rulesets"] or [str(form.get("ruleset", ""))], user)
             elif action == "revert":
                 run_id = await portal.revert(tid, loc, user)
             elif action == "unlink":
@@ -203,7 +215,9 @@ def create_app(cfg: Settings, api=None) -> Starlette:
             elif action == "adopt":
                 role, current = await portal.role_content(tid, loc)
                 tags = R.tags_of(role)
-                rs = await db(store.get_ruleset, tags[0]) if tags else None
+                if len(tags) != 1:
+                    raise ValueError("Copying rules into a draft works only for a role profile with one rule set.")
+                rs = await db(store.get_ruleset, tags[0])
                 if rs is None:
                     raise ValueError("This role profile isn't linked to a rule set in this app.")
                 await db(store.save_draft, rs["name"], current, user)
@@ -236,8 +250,8 @@ def create_app(cfg: Settings, api=None) -> Starlette:
         return names, published, sets, locs
 
     def _start_new_ruleset(request: Request, back: str, f: dict) -> Response:
-        """Park the role form and go create a rule set; the form comes back with it selected."""
-        values = {k: v for k, v in f.items() if k not in ("csrf", "ruleset", "name")}
+        """Park the role form and go create a rule set; the form comes back with it in the list."""
+        values = {k: v for k, v in f.items() if k not in ("csrf", "name")}
         request.session["role_draft"] = {"back": back, "values": values, "ruleset": None,
                                          "label": f.get("profile_name") or "new role profile"}
         return RedirectResponse("/rulesets/new", 303)
@@ -249,10 +263,15 @@ def create_app(cfg: Settings, api=None) -> Starlette:
         f = {**f, **draft["values"]}
         notes = []
         name = draft.get("ruleset")
+        sets_ = [n for n in f.get("rulesets") or []]
         if name and name in published:
-            f["ruleset"], f["fw_on"] = name, "1"
-        elif name:
-            notes.append(f"Rule set {name} isn't published yet. Publish it to select it here.")
+            sets_ = [name if n == F.NEW_RULESET else n for n in sets_] if F.NEW_RULESET in sets_ else sets_ + [name]
+            f["fw_on"] = "1"
+        else:
+            sets_ = [n for n in sets_ if n != F.NEW_RULESET]
+            if name:
+                notes.append(f"Rule set {name} isn't published yet. Publish it to add it here.")
+        f["rulesets"] = list(dict.fromkeys(sets_))
         return f, notes
 
     async def role_new(request: Request) -> Response:
@@ -265,11 +284,11 @@ def create_app(cfg: Settings, api=None) -> Starlette:
             f, notes = (_resume(request, F.new_fields(str(loc)), published) if request.query_params.get("resume")
                         else (F.new_fields(str(loc)), []))
             return page(request, "Add role profile", P.role_form("create", f, notes, locs, sets), "roles")
-        form = dict(await request.form())
+        form = await read_form(request)
         f, errors = F.parse(form, existing_names=names, published=published, creating=True, locations=locs)
         if errors:
             return page(request, "Add role profile", P.role_form("create", f, errors, locs, sets), "roles", 400)
-        if f.get("ruleset") == F.NEW_RULESET:
+        if F.NEW_RULESET in f["rulesets"]:
             return _start_new_ruleset(request, "/roles/new?resume=1", f)
         try:
             run_id = await portal.create_role(f, user_of(request))
@@ -279,11 +298,10 @@ def create_app(cfg: Settings, api=None) -> Starlette:
 
     async def role_edit(request: Request) -> Response:
         tid = int(request.path_params["tid"])
-        form = dict(await request.form()) if request.method == "POST" else {}
+        form = await read_form(request) if request.method == "POST" else {}
         loc = loc_param(request, form if request.method == "POST" else None)
         role = await portal.get_role(tid, loc)
-        tags = R.tags_of(role)
-        current = tags[0] if tags else ""
+        current = R.tags_of(role)
         names, published, sets, locs = await _form_context(exclude_tid=tid)
         all_locs = await portal.locations()
         title = f"Edit {role.get('templateName')}"
@@ -299,11 +317,11 @@ def create_app(cfg: Settings, api=None) -> Starlette:
             if request.query_params.get("resume"):
                 f, notes = _resume(request, f, published)
             return render(f, notes)
-        f, errors = F.parse(form, existing_names=names, published=published, current_ruleset=current, creating=False,
-                            keep_allowed=bool(role.get("firewallEnabled")))
+        f, errors = F.parse(form, existing_names=names, published=published, current_rulesets=current,
+                            creating=False, keep_allowed=bool(role.get("firewallEnabled")))
         if errors:
             return render(f, errors, 400)
-        if f.get("ruleset") == F.NEW_RULESET:
+        if F.NEW_RULESET in f["rulesets"]:
             return _start_new_ruleset(request, f"/roles/{tid}/edit?loc={loc}&resume=1", f)
         try:
             run_id = await portal.update_role(tid, loc, f, user_of(request))
@@ -332,7 +350,7 @@ def create_app(cfg: Settings, api=None) -> Starlette:
     async def rulesets_page(request: Request) -> Response:
         sets = await db(store.list_rulesets)
         rows = await portal.role_rows()
-        usage = {s["name"]: [r for r in rows if r.ruleset == s["name"]] for s in sets}
+        usage = {s["name"]: [r for r in rows if s["name"] in r.rulesets] for s in sets}
         unmanaged = [r for r in rows if r.status == "unmanaged" and r.role.get("firewallEnabled")]
         return page(request, "Rule sets", P.rulesets(sets, usage, unmanaged), "rulesets")
 
@@ -372,7 +390,7 @@ def create_app(cfg: Settings, api=None) -> Starlette:
     async def ruleset_page(request: Request) -> Response:
         name = request.path_params["name"]
         rs = await db(store.get_ruleset, name)
-        rows = [r for r in await portal.role_rows() if r.ruleset == name]
+        rows = [r for r in await portal.role_rows() if name in r.rulesets]
         if rs is None:
             if R.NAME_RE.match(name):
                 return page(request, name, P.ruleset_missing(name, rows), "rulesets")
@@ -476,7 +494,7 @@ def create_app(cfg: Settings, api=None) -> Starlette:
 
     async def ruleset_delete(request: Request) -> Response:
         name = request.path_params["name"]
-        linked = [r for r in await portal.role_rows() if r.ruleset == name]
+        linked = [r for r in await portal.role_rows() if name in r.rulesets]
         if linked:
             flash(request, "error", f"Unlink the {len(linked)} role profile(s) using {name} before deleting it.")
             return RedirectResponse(f"/rulesets/{name}", 303)

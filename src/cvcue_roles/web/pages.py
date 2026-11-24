@@ -10,12 +10,11 @@ from .. import rules as R
 CSRF = '<input type="hidden" name="csrf" value="__CSRF__">'
 
 STATUS = {
-    "in_sync": ("ok", "In sync · v{v}"),
-    "behind": ("pend", "Update pending · on v{v}"),
+    "in_sync": ("ok", "In sync"),
+    "behind": ("pend", "Update pending"),
     "drifted": ("warn", "Edited in CV-CUE"),
-    "not_published": ("muted", "Rule set not published"),
-    "unknown_ruleset": ("warn", "Unknown rule set"),
-    "multiple_tags": ("warn", "More than one rule set tag"),
+    "not_published": ("muted", "Waiting for {m} to be published"),
+    "unknown_ruleset": ("warn", "Unknown rule set: {m}"),
     "unmanaged": ("none", "Not managed"),
 }
 
@@ -122,7 +121,14 @@ def login(google: bool, dev: bool, nxt: str, error: str | None) -> str:
 
 def status_pill(row) -> str:
     cls, label = STATUS[row.status]
-    return f'<span class="pill {cls}">{esc(label.format(v=row.version))}</span>'
+    text = label.format(m=", ".join(row.missing))
+    title = ""
+    if row.status == "in_sync" and row.versions:
+        text += " · " + " + ".join(f"v{row.versions[n]}" for n in row.rulesets)
+        title = ", ".join(f"{n} v{row.versions[n]}" for n in row.rulesets)
+    elif row.status == "behind" and row.version:
+        text += f" · on v{row.version}"
+    return f'<span class="pill {cls}" title="{esc(title)}">{esc(text)}</span>'
 
 
 def role_link(row) -> str:
@@ -140,6 +146,13 @@ def ruleset_link(name: str | None) -> str:
     return f'<a href="/rulesets/{esc(name)}">{esc(name)}</a>' if name else '<span class="none">None</span>'
 
 
+def ruleset_links(names: list[str]) -> str:
+    """Linked rule sets in the order they apply."""
+    if not names:
+        return '<span class="none">None</span>'
+    return '<span class="none"> + </span>'.join(ruleset_link(n) for n in names)
+
+
 def roles(rows, sets) -> str:
     pending = [s for s in sets if s["has_changes"]]
     banner = "".join(f'<div class="flash pend"><b>{esc(s["name"])}</b> has unpublished changes. '
@@ -150,7 +163,7 @@ def roles(rows, sets) -> str:
         rid = f"sel-{r.template_id}"
         trs.append(f'<tr class="pick"><td class="n"><input type="radio" name="sel" id="{rid}" '
                    f'value="{r.template_id}:{esc(r.location_id)}" aria-label="Select {esc(role.get("templateName"))}"></td>'
-                   f'<td>{role_link(r)}</td><td>{esc(r.location)}</td><td>{ruleset_link(r.ruleset)}</td>'
+                   f'<td>{role_link(r)}</td><td>{esc(r.location)}</td><td>{ruleset_links(r.rulesets)}</td>'
                    f'<td>{vlan_label(role)}</td><td>{"On" if role.get("firewallEnabled") else "Off"}</td>'
                    f'<td>{status_pill(r)}</td></tr>')
     managed = sum(1 for r in rows if r.ruleset)
@@ -167,11 +180,11 @@ def roles(rows, sets) -> str:
     return (f'<h1>Network profiles · Roles</h1><p class="sub">{len(rows)} role profiles, {managed} linked to a rule set. '
             'Link a role profile to a rule set to manage its firewall rules from here.</p>' + banner +
             '<form method="get" id="rolesForm" class="card tw">' + toolbar +
-            '<table><tr><th></th><th>Role profile</th><th>Location</th><th>Firewall rule set</th>'
+            '<table><tr><th></th><th>Role profile</th><th>Location</th><th>Firewall rule sets</th>'
             '<th>VLAN</th><th>Firewall</th><th>Sync status</th></tr>' + "".join(trs) + "</table></form>" + script)
 
 
-def role_form(mode: str, f: dict, errors: list[str], locations: dict, sets: list[dict], current_ruleset: str = "",
+def role_form(mode: str, f: dict, errors: list[str], locations: dict, sets: list[dict], current_rulesets=None,
               tid: int | None = None, loc=None, role: dict | None = None) -> str:
     """Add/edit role profile, laid out like the CV-CUE role editor."""
     v = f.get
@@ -189,28 +202,43 @@ def role_form(mode: str, f: dict, errors: list[str], locations: dict, sets: list
         on = "checked" if (v(field) or default) == value else ""
         return (f'<label class="opt"><input type="radio" name="{field}" value="{value}" {on}> {label}</label>')
 
-    # --- rule set options
+    # --- rule sets: an ordered list, combined in that order
+    current_rulesets = current_rulesets or []
     names = {s["name"] for s in sets}
-    rs_opts = []
-    if not creating and role.get("firewallEnabled"):
-        rs_opts.append(f'<option value="" {sel("ruleset", "")}>Keep current rules (not managed by a rule set)</option>')
-    else:
-        rs_opts.append(f'<option value="" {sel("ruleset", "")} disabled>Select a rule set</option>')
-    for s in sets:
-        if s["latest"]:
-            rs_opts.append(f'<option value="{esc(s["name"])}" {sel("ruleset", s["name"])}>{esc(s["name"])} '
-                           f'(v{s["latest"]}, {len(s["published"]["rules"])} rules)</option>')
-        else:
-            rs_opts.append(f'<option value="{esc(s["name"])}" disabled>{esc(s["name"])} (not published yet)</option>')
-    if current_ruleset and current_ruleset not in names:
-        rs_opts.append(f'<option value="{esc(current_ruleset)}" {sel("ruleset", current_ruleset)}>'
-                       f'{esc(current_ruleset)} (keep tag; not set up in this app)</option>')
-    rs_opts.append('<option value="__new__">+ Create new rule set…</option>')
+    keep_ok = not creating and role.get("firewallEnabled")
+
+    def rs_select(selected: str) -> str:
+        opts = ['<option value="">Select a rule set</option>']
+        for s in sets:
+            if s["latest"]:
+                on = "selected" if s["name"] == selected else ""
+                opts.append(f'<option value="{esc(s["name"])}" {on}>{esc(s["name"])} '
+                            f'(v{s["latest"]}, {len(s["published"]["rules"])} rules)</option>')
+            else:
+                opts.append(f'<option value="{esc(s["name"])}" disabled>{esc(s["name"])} (not published yet)</option>')
+        for n in current_rulesets:
+            if n not in names:
+                on = "selected" if n == selected else ""
+                opts.append(f'<option value="{esc(n)}" {on}>{esc(n)} (keep tag; not set up in this app)</option>')
+        on = "selected" if selected == "__new__" else ""
+        opts.append(f'<option value="__new__" {on}>+ Create new rule set…</option>')
+        return ('<div class="rs-row row" style="margin-bottom:8px"><span class="rs-n sub" style="margin:0;min-width:18px"></span>'
+                f'<select name="rulesets" aria-label="Rule set" style="max-width:440px;flex:1">{"".join(opts)}</select>'
+                '<button type="button" class="small rs-up" aria-label="Move up">↑</button>'
+                '<button type="button" class="small rs-down" aria-label="Move down">↓</button>'
+                '<button type="button" class="small danger rs-del">Remove</button></div>')
+
+    chosen = [n for n in (v("rulesets") or []) if n]
+    rs_rows = "".join(rs_select(n) for n in chosen) + rs_select("")
     previews = "".join(
-        f'<div class="rs-preview" data-rs="{esc(s["name"])}" hidden><div class="row" style="justify-content:space-between;margin:10px 0 6px">'
-        f'<span class="sub" style="margin:0">{esc(s["description"]) or "Rules in " + esc(s["name"])} · v{s["latest"]}</span>'
+        f'<div class="rs-preview" data-rs="{esc(s["name"])}" data-default="{s["published"]["default_action"]}" hidden>'
+        f'<div class="row" style="justify-content:space-between;margin:12px 0 6px">'
+        f'<span><b>{esc(s["name"])}</b> <span class="sub" style="margin:0">v{s["latest"]}'
+        f'{" · " + esc(s["description"]) if s["description"] else ""}</span></span>'
         f'<a class="btn small" href="/rulesets/{esc(s["name"])}" target="_blank" rel="noopener">Edit rule set</a></div>'
-        f'{rules_table(s["published"])}</div>' for s in sets if s["latest"])
+        f'{rules_table(s["published"], show_default=False)}</div>' for s in sets if s["latest"])
+    keep_hint = ("Leave the list empty to keep this role profile's current rules without a rule set."
+                 if keep_ok else "")
 
     # --- location
     if creating:
@@ -232,16 +260,32 @@ def role_form(mode: str, f: dict, errors: list[str], locations: dict, sets: list
     crumb = ("Add role profile" if creating else
              f'<a href="/roles/{tid}?loc={esc(loc)}">{esc(v("orig_name") or v("profile_name"))}</a> / Edit')
     cancel = "/roles" if creating else f"/roles/{tid}?loc={esc(loc)}"
-    script = ('<script>(function(){var f=document.getElementById("roleForm");function sync(){'
-              'var t=(f.querySelector("input[name=vlan_type]:checked")||{}).value||"id";'
+    script = ('<script>(function(){var f=document.getElementById("roleForm");var list=f.querySelector("#rsList");'
+              'function sync(){var t=(f.querySelector("input[name=vlan_type]:checked")||{}).value||"id";'
               'f.querySelectorAll("[data-vlan]").forEach(function(e){e.hidden=e.dataset.vlan!==t;});'
-              'var von=f.querySelector("input[name=vlan_on]").checked;f.querySelector("#vlanBody").style.opacity=von?1:.45;'
+              'f.querySelector("#vlanBody").style.opacity=f.querySelector("input[name=vlan_on]").checked?1:.45;'
               'var fon=f.querySelector("input[name=fw_on]").checked;f.querySelector("#fwBody").style.opacity=fon?1:.45;'
-              'var rs=f.querySelector("select[name=ruleset]").value;'
-              'f.querySelectorAll(".rs-preview").forEach(function(e){e.hidden=e.dataset.rs!==rs;});'
-              'f.querySelector("#newHint").hidden=rs!=="__new__";'
-              'f.querySelector("#saveBtn").textContent=rs==="__new__"&&fon?"Continue to create rule set":f.querySelector("#saveBtn").dataset.label;}'
-              'f.addEventListener("change",sync);sync();})();</script>')
+              'var rows=list.querySelectorAll(".rs-row"),vals=[],isNew=false,n=0;'
+              'rows.forEach(function(r,i){var v=r.querySelector("select").value;r.querySelector(".rs-n").textContent=v?(++n)+".":"";'
+              'r.querySelector(".rs-up").hidden=i===0;r.querySelector(".rs-down").hidden=i===rows.length-1;'
+              'if(v==="__new__")isNew=true;else if(v&&vals.indexOf(v)<0)vals.push(v);});'
+              'var box=f.querySelector("#rsPreviews"),block=false,shown=0;'
+              'box.querySelectorAll(".rs-preview").forEach(function(p){p.hidden=true;});'
+              'vals.forEach(function(v){var p=box.querySelector(\'.rs-preview[data-rs="\'+CSS.escape(v)+\'"]\');'
+              'if(p){box.appendChild(p);p.hidden=false;shown++;if(p.dataset.default==="2")block=true;}});'
+              'var d=f.querySelector("#rsDefault");d.hidden=!shown;d.textContent="Then the default rule: "+(block?"Block":"Allow")+'
+              '(shown>1?(block?" (at least one rule set blocks by default)":" (every rule set allows by default)"):"")+".";'
+              'f.querySelector("#newHint").hidden=!isNew;var b=f.querySelector("#saveBtn");'
+              'b.textContent=isNew&&fon?"Continue to create rule set":b.dataset.label;}'
+              'f.addEventListener("change",sync);'
+              'f.querySelector("#rsAdd").addEventListener("click",function(){list.appendChild('
+              'document.getElementById("rsTpl").content.firstElementChild.cloneNode(true));sync();});'
+              'list.addEventListener("click",function(e){var r=e.target.closest(".rs-row");if(!r)return;'
+              'if(e.target.classList.contains("rs-del")){if(list.querySelectorAll(".rs-row").length>1)r.remove();'
+              'else r.querySelector("select").value="";}'
+              'else if(e.target.classList.contains("rs-up")&&r.previousElementSibling)list.insertBefore(r,r.previousElementSibling);'
+              'else if(e.target.classList.contains("rs-down")&&r.nextElementSibling)list.insertBefore(r.nextElementSibling,r);'
+              'else return;sync();});sync();})();</script>')
     save = "Create role profile" if creating else "Save changes"
     return (f'<div class="crumb"><a href="/roles">Role profiles</a> / {crumb}</div>'
             f'<h1>{"Add role profile" if creating else "Edit role profile"}</h1>'
@@ -278,13 +322,16 @@ def role_form(mode: str, f: dict, errors: list[str], locations: dict, sets: list
             '<div class="card"><h2>Firewall</h2>'
             f'<label class="opt"><input type="checkbox" name="fw_on" value="1" {checked("fw_on")}> Layer 3-4 firewall rules</label>'
             '<div id="fwBody" style="margin-top:10px">'
-            f'<label>Firewall rule set<select name="ruleset" style="max-width:520px">{"".join(rs_opts)}</select></label>'
+            '<div class="l" style="font-size:12px;color:var(--muted);margin-bottom:6px">Firewall rule sets, applied in this order</div>'
+            f'<div id="rsList">{rs_rows}</div><template id="rsTpl">{rs_select("")}</template>'
+            '<button type="button" class="small" id="rsAdd">+ Add another rule set</button>'
             '<p class="sub" id="newHint" style="margin:8px 0 0" hidden>You\'ll create the rule set next, then come back here with it '
-            'selected. What you\'ve entered on this page is kept.</p>'
-            f'{previews}'
-            '<p class="sub" style="margin:10px 0 0">A rule set holds the rules and the default rule. Choosing one applies its latest '
-            'published version and links the role profile, so later publishes update it too. '
-            '<a href="/rulesets">Manage rule sets</a></p></div>'
+            'added. What you\'ve entered on this page is kept.</p>'
+            f'<div id="rsPreviews">{previews}</div>'
+            '<p class="sub" id="rsDefault" style="margin:10px 0 0" hidden></p>'
+            '<p class="sub" style="margin:10px 0 0">Rules from each rule set are applied one after another, in this order, '
+            'followed by one default rule: Block if any rule set blocks by default. Publishing any of them updates this '
+            f'role profile. {keep_hint} <a href="/rulesets">Manage rule sets</a></p></div>'
             f'<p class="sub" style="margin:14px 0 0">Application firewall rules: {app_fw}. Manage them in CV-CUE.</p></div>'
             # --- Bandwidth
             '<div class="card"><h2>User bandwidth control</h2><div class="grid" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr)">'
@@ -306,7 +353,7 @@ def role_delete(row, refs: list[str]) -> str:
     else:
         body = (f'<p>This permanently deletes the role profile <b>{name}</b> from CV-CUE at {esc(row.location)}. '
                 'It can\'t be undone here; you\'d have to create it again.</p>'
-                + (f'<p class="sub">It\'s linked to {esc(row.ruleset)}; the rule set itself is kept.</p>' if row.ruleset else "")
+                + (f'<p class="sub">It\'s linked to {esc(" + ".join(row.rulesets))}; the rule sets themselves are kept.</p>' if row.rulesets else "")
                 + f'<form method="post" action="/roles/{tid}/delete" class="row">{CSRF}'
                 f'<input type="hidden" name="loc" value="{esc(loc)}"><button class="primary danger-fill">Delete {name}</button>'
                 f'<a class="btn" href="/roles/{tid}?loc={esc(loc)}">Cancel</a></form>')
@@ -368,7 +415,7 @@ def ruleset_missing(name: str, linked) -> str:
 
 
 def rules_table(content: dict, compare: dict | None = None, editable: bool = False, name: str = "",
-                edit_i: int | None = None) -> str:
+                edit_i: int | None = None, show_default: bool = True) -> str:
     c = R.normalize(content)
     known = {R.describe(r) for r in (compare or {}).get("rules", [])} if compare is not None else None
     trs = []
@@ -397,58 +444,58 @@ def rules_table(content: dict, compare: dict | None = None, editable: bool = Fal
                         '</select><button class="small">Set</button></form>')
     else:
         default_cell = R.ACTIONS[c["default_action"]]
-    changed_default = compare is not None and compare.get("default_action") != c["default_action"]
-    trs.append(f'<tr class="{"new" if changed_default else ""}"><td class="n">·</td><td style="color:var(--muted)">Default rule</td>'
-               f'<td>Any</td><td>Any</td><td>Any</td><td>Any</td><td>{default_cell}</td>{"<td></td>" if editable else ""}</tr>')
+    if show_default:
+        changed_default = compare is not None and compare.get("default_action") != c["default_action"]
+        trs.append(f'<tr class="{"new" if changed_default else ""}"><td class="n">·</td><td style="color:var(--muted)">Default rule</td>'
+                   f'<td>Any</td><td>Any</td><td>Any</td><td>Any</td><td>{default_cell}</td>{"<td></td>" if editable else ""}</tr>')
     head = ("<tr><th></th><th>Rule name</th><th>Direction</th><th>Protocol</th><th>Port</th><th>Hostname</th>"
             f'<th>Action</th>{"<th></th>" if editable else ""}</tr>')
     return f'<div class="tw"><table>{head}{"".join(trs)}</table></div>'
 
 
-def role_detail(row, current, sets, latest, changes) -> str:
+def role_detail(row, current, sets, target, changes) -> str:
     role = row.role
     tid, loc = row.template_id, row.location_id
     hidden = f'{CSRF}<input type="hidden" name="loc" value="{esc(loc)}">'
-    rs_link = ruleset_link(row.ruleset)
+    names = row.rulesets
+    label_html = " + ".join(esc(n) for n in names)
     info = (f'<div class="grid" style="margin-bottom:16px">'
             f'<div class="stat"><div class="l">Location</div>{esc(row.location)}</div>'
             f'<div class="stat"><div class="l">VLAN</div>{vlan_label(role)}</div>'
             f'<div class="stat"><div class="l">Firewall</div>{"On" if role.get("firewallEnabled") else "Off"}</div>'
-            f'<div class="stat"><div class="l">Firewall rule set</div>'
-            f'{rs_link}</div>'
+            f'<div class="stat"><div class="l">Firewall rule sets</div>{ruleset_links(names)}</div>'
             f'<div class="stat"><div class="l">Sync status</div>{status_pill(row)}</div></div>')
     published = [s for s in sets if s["latest"]]
-    link_form = ""
-    if published:
-        opts = "".join(f'<option value="{esc(s["name"])}" {"selected" if s["name"] == row.ruleset else ""}>'
-                       f'{esc(s["name"])} (v{s["latest"]})</option>' for s in published)
-        link_form = (f'<form method="get" action="/roles/{tid}/link" class="row"><input type="hidden" name="loc" value="{esc(loc)}">'
-                     f'<select name="ruleset" aria-label="Rule set">{opts}</select>'
-                     f'<button>{"Change rule set" if row.ruleset else "Link to rule set"}</button></form>')
     actions = []
-    if row.status in ("drifted", "behind") and latest:
+    if row.status in ("drifted", "behind") and target:
         lines = "".join(_diff_line(k, t) for k, t in changes)
-        what = ("Someone changed this role profile's firewall rules in CV-CUE. They no longer match any published version."
-                if row.status == "drifted" else f"This role profile still has v{row.version}.")
-        actions.append(f'<div class="card"><h2>Out of sync with {esc(row.ruleset)} v{latest["version"]}</h2><p>{what}</p>'
-                       f'<p class="sub">Changes needed to match v{latest["version"]}:</p><div class="diff">{lines}</div>'
+        what = ("Someone changed this role profile's firewall rules in CV-CUE. They no longer match the published rule sets."
+                if row.status == "drifted" else "A newer version of a linked rule set hasn't been applied to this role profile.")
+        actions.append(f'<div class="card"><h2>Out of sync with {label_html}</h2><p>{what}</p>'
+                       f'<p class="sub">Changes needed to match the latest published versions:</p><div class="diff">{lines}</div>'
                        f'<div class="row" style="margin-top:12px"><form method="post" action="/roles/{tid}/revert" class="inline">{hidden}'
-                       f'<button class="primary">Apply v{latest["version"]} to this role profile</button></form>'
+                       '<button class="primary">Apply the latest rule sets to this role profile</button></form>'
                        + (f'<form method="post" action="/roles/{tid}/adopt" class="inline">{hidden}'
-                          f'<button>Copy these rules into the {esc(row.ruleset)} draft</button></form>'
-                          if row.status == "drifted" else "") + "</div></div>")
+                          f'<button>Copy these rules into the {esc(names[0])} draft</button></form>'
+                          if row.status == "drifted" and len(names) == 1 else "") + "</div></div>")
     manage = []
-    if link_form:
-        manage.append(link_form)
-    if row.ruleset:
+    addable = [s for s in published if s["name"] not in names]
+    if addable:
+        keep = "".join(f'<input type="hidden" name="rulesets" value="{esc(n)}">' for n in names)
+        opts = "".join(f'<option value="{esc(s["name"])}">{esc(s["name"])} (v{s["latest"]})</option>' for s in addable)
+        manage.append(f'<form method="get" action="/roles/{tid}/link" class="row"><input type="hidden" name="loc" value="{esc(loc)}">'
+                      f'{keep}<select name="rulesets" aria-label="Rule set to add">{opts}</select>'
+                      f'<button>{"Add rule set" if names else "Link to rule set"}</button></form>')
+    if names:
+        manage.append(f'<a class="btn" href="/roles/{tid}/edit?loc={esc(loc)}#fwBody">Reorder or remove rule sets</a>')
         manage.append(f'<form method="post" action="/roles/{tid}/unlink" class="inline">{hidden}'
-                      '<button class="danger">Unlink (keep current rules)</button></form>')
-    if role.get("firewallEnabled") and not row.ruleset:
+                      f'<button class="danger">Unlink {"all rule sets" if len(names) > 1 else "rule set"} (keep current rules)</button></form>')
+    if role.get("firewallEnabled") and not names:
         manage.append(f'<form method="post" action="/rulesets" class="row">{CSRF}'
                       f'<input type="hidden" name="source" value="role:{tid}:{esc(loc)}">'
                       f'<input name="name" placeholder="new-rule-set-name" aria-label="New rule set name" required>'
                       '<button>Create rule set from these rules</button></form>')
-    if not published and not row.ruleset:
+    if not published and not names:
         manage.append('<p class="sub">Publish a rule set first, then link this role profile to it.</p>')
     head_buttons = (f'<div class="row"><a class="btn primary" href="/roles/{tid}/edit?loc={esc(loc)}">Edit role profile</a>'
                     f'<a class="btn danger" href="/roles/{tid}/delete?loc={esc(loc)}">Delete</a></div>')
@@ -459,24 +506,26 @@ def role_detail(row, current, sets, latest, changes) -> str:
             f'<div class="card"><h2>Firewall rules on CV-CUE</h2>'
             f'{rules_table(current) if role.get("firewallEnabled") else "<p>Firewall is off for this role profile.</p>"}</div>'
             f'<div class="card"><h2>Manage</h2><div class="row" style="gap:16px">{"".join(manage)}</div>'
-            '<p class="sub" style="margin:12px 0 0">Linking writes <span class="mono">ruleset:&lt;name&gt;</span> into the role '
-            'profile\'s CV-CUE description and applies the rule set\'s latest published version. VLAN, traffic control, '
-            'and web quarantine settings stay as they are.</p></div>')
+            '<p class="sub" style="margin:12px 0 0">Each linked rule set is a <span class="mono">ruleset:&lt;name&gt;</span> tag in '
+            'the role profile\'s CV-CUE description. Their rules are applied in order, then one default rule (Block if any '
+            'rule set blocks by default). VLAN, traffic control, and web quarantine settings stay as they are.</p></div>')
 
 
-def link_review(role, loc, name, version, changes) -> str:
+def link_review(role, loc, names, content, changes) -> str:
     tid = role["templateId"]
-    lines = "".join(_diff_line(k, t) for k, t in changes) or "No firewall changes; only the description tag is added."
+    label_html = " + ".join(esc(n) for n in names)
+    lines = "".join(_diff_line(k, t) for k, t in changes) or "No firewall changes; only the description tags change."
+    keep = "".join(f'<input type="hidden" name="rulesets" value="{esc(n)}">' for n in names)
     return (f'<div class="crumb"><a href="/roles">Role profiles</a> / <a href="/roles/{tid}?loc={esc(loc)}">'
-            f'{esc(role["templateName"])}</a> / Link</div><h1>Link {esc(role["templateName"])} to {esc(name)}</h1>'
-            f'<p class="sub">This applies {esc(name)} v{version["version"]} and tags the role profile so later '
-            'publishes update it too.</p>'
+            f'{esc(role["templateName"])}</a> / Link</div><h1>Link {esc(role["templateName"])} to {label_html}</h1>'
+            '<p class="sub">This applies the latest published version of each rule set, in this order, and tags the role '
+            'profile so later publishes update it too.</p>'
             f'<div class="card"><h2>Changes on CV-CUE</h2><div class="diff">{lines}</div>'
             f'<div class="diff">~ description: "{esc(role.get("description") or "")}" → '
-            f'"{esc(R.set_tag(role.get("description"), name))}"</div>'
+            f'"{esc(R.set_tags(role.get("description"), names))}"</div>'
             f'<form method="post" action="/roles/{tid}/link" class="row" style="margin-top:12px">{CSRF}'
-            f'<input type="hidden" name="loc" value="{esc(loc)}"><input type="hidden" name="ruleset" value="{esc(name)}">'
-            f'<button class="primary">Link and apply v{version["version"]}</button>'
+            f'<input type="hidden" name="loc" value="{esc(loc)}">{keep}'
+            '<button class="primary">Link and apply</button>'
             f'<a class="btn" href="/roles/{tid}?loc={esc(loc)}">Cancel</a></form></div>')
 
 
@@ -627,10 +676,17 @@ def review(plan, draft=None) -> str:
                    "VLAN, traffic control, and web quarantine settings stay as they are.")
     blocks = []
     for item in plan.items:
-        body = ("".join(_diff_line(k, t) for k, t in item.changes) if item.changes
-                else '<div style="color:var(--muted)">Already matches. Not updated.</div>')
+        if item.blocked:
+            body = f'<div class="tilde">{esc(item.blocked)}. Not updated.</div>'
+        elif item.changes:
+            body = "".join(_diff_line(k, t) for k, t in item.changes)
+        else:
+            body = '<div style="color:var(--muted)">Already matches. Not updated.</div>'
+        others = [n for n in item.row.rulesets if n != name]
+        combined = (f'<span class="sub" style="margin:0"> · combined with {", ".join(esc(n) for n in others)}</span>'
+                    if others else "")
         blocks.append(f'<div style="margin-bottom:12px"><div>{role_link(item.row)} '
-                      f'<span style="color:var(--muted)">· {esc(item.row.location)}</span> {status_pill(item.row)}</div>'
+                      f'<span style="color:var(--muted)">· {esc(item.row.location)}</span> {status_pill(item.row)}{combined}</div>'
                       f'<div class="diff">{body}</div></div>')
     can = plan.new_version or upd
     button = (f'<form method="post" action="/rulesets/{esc(name)}/publish" class="row">{CSRF}'
@@ -683,7 +739,7 @@ def activity(runs) -> str:
 def run(r, draft=None) -> str:
     kind = r["kind"]
     results = r["results"]
-    has_set = r["ruleset"] not in ("", "-")
+    has_set = r["ruleset"] not in ("", "-") and " + " not in r["ruleset"]
     done, fail = '<span class="pill ok">Done</span>', '<span class="pill bad">Failed</span>'
 
     def role_cell(x) -> str:

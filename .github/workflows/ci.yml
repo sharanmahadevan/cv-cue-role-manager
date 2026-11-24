@@ -39,7 +39,9 @@ jobs:
         run: flyctl deploy --remote-only
       - name: Health check
         if: env.FLY_API_TOKEN != ''
-        run: curl -fsS --retry 6 --retry-delay 5 --retry-all-errors https://cv-cue-role-manager.fly.dev/healthz
+        run: |
+          app=$(sed -n 's/^app = "\(.*\)"/\1/p' fly.toml)
+          curl -fsS --retry 6 --retry-delay 5 --retry-all-errors "https://$app.fly.dev/healthz"
       - name: No deploy token
         if: env.FLY_API_TOKEN == ''
         run: echo "::notice::FLY_API_TOKEN is not set; skipped the Fly deploy."
