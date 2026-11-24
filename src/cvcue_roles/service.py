@@ -75,6 +75,7 @@ class PlanItem:
     changes: list[tuple[str, str]]
     target: dict | None = None        # combined rules this role profile should get
     blocked: str = ""                  # why it can't be updated now
+    notes: list[str] = field(default_factory=list)   # duplicates left out / rules that never apply
 
 
 @dataclass
@@ -186,21 +187,28 @@ class Portal:
                                       applied.get(role.get("templateId"))))
         return rows
 
-    async def latest_contents(self, names: list[str], overrides: dict | None = None) -> tuple[dict, list[str]]:
-        """Combined rules for `names` from their latest published versions (or `overrides`),
-        plus the names that have no published version."""
-        contents, missing, versions = [], [], {}
+    async def combine_latest(self, names: list[str], overrides: dict | None = None
+                             ) -> tuple[dict, list[str], list[dict], list[dict]]:
+        """Combined rules for `names` from their latest published versions (or `overrides`).
+
+        Returns (content, missing, skipped, conflicts); see `rules.combine`.
+        """
+        named, missing = [], []
         for n in names:
             if overrides and n in overrides:
-                contents.append(overrides[n])
+                named.append((n, overrides[n]))
                 continue
             vs = await self._db(self.store.versions, n)
             if not vs:
                 missing.append(n)
                 continue
-            contents.append(vs[0]["content"])
-            versions[n] = vs[0]["version"]
-        return R.compose(contents), missing
+            named.append((n, vs[0]["content"]))
+        content, skipped, conflicts = R.combine(named)
+        return content, missing, skipped, conflicts
+
+    async def latest_contents(self, names: list[str], overrides: dict | None = None) -> tuple[dict, list[str]]:
+        content, missing, _, _ = await self.combine_latest(names, overrides)
+        return content, missing
 
     # ------------------------------------------------------------ publish
     async def plan(self, name: str) -> Plan:
@@ -210,13 +218,14 @@ class Portal:
         draft = rs["draft"]
         items = []
         for row in [r for r in await self.role_rows() if name in r.rulesets]:
-            target, missing = await self.latest_contents(row.rulesets, {name: draft})
+            target, missing, skipped, conflicts = await self.combine_latest(row.rulesets, {name: draft})
             current = R.from_role(row.role)
             if missing:
                 items.append(PlanItem(row, [], None, "Waiting for " + ", ".join(missing) + " to be published"))
                 continue
+            notes = [R.note_text(n, "skipped") for n in skipped] + [R.note_text(n, "conflict") for n in conflicts]
             same = current is not None and R.fingerprint(current) == R.fingerprint(target)
-            items.append(PlanItem(row, [] if same else R.diff(current, target), target))
+            items.append(PlanItem(row, [] if same else R.diff(current, target), target, notes=notes))
         plan = Plan(rs, draft, rs["has_changes"], items)
         plan.token = self._token(plan)
         return plan

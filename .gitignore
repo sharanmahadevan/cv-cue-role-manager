@@ -13,3 +13,5 @@ build/
 .claude/
 *.db
 *.db-*
+.coverage
+htmlcov/

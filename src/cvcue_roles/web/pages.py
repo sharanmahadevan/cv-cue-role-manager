@@ -57,6 +57,10 @@ input[type=radio]{accent-color:var(--accent);width:16px;height:16px;padding:0}fi
 .req{color:var(--bad);margin-left:2px}.opt{flex-direction:row;align-items:center;gap:8px;color:var(--text);font-size:14px}
 .opt.big{font-size:16px;font-weight:600}.dashed{border:1px dashed var(--border);border-radius:8px;padding:16px;display:flex;align-items:center}
 [hidden]{display:none!important}
+@media (max-width:640px){main .grid{grid-template-columns:1fr!important}main .grid>label,main .grid>div{grid-area:auto!important;grid-column:auto!important}
+header{padding:10px 16px}main{padding:16px 12px 48px}}
+tr.dup td{opacity:.45}tr.dup td:nth-child(2){text-decoration:line-through}.rs-note{font-size:12px;margin-left:6px;display:inline-block}
+tr.dup .rs-note{text-decoration:none;color:var(--muted)}tr.conflict td{background:var(--warn-bg)}tr.conflict .rs-note{color:var(--warn)}
 .tag{font-size:11px;background:var(--neutral);color:var(--muted);padding:1px 7px;border-radius:6px}
 """
 
@@ -236,7 +240,7 @@ def role_form(mode: str, f: dict, errors: list[str], locations: dict, sets: list
         f'<span><b>{esc(s["name"])}</b> <span class="sub" style="margin:0">v{s["latest"]}'
         f'{" · " + esc(s["description"]) if s["description"] else ""}</span></span>'
         f'<a class="btn small" href="/rulesets/{esc(s["name"])}" target="_blank" rel="noopener">Edit rule set</a></div>'
-        f'{rules_table(s["published"], show_default=False)}</div>' for s in sets if s["latest"])
+        f'{rules_table(s["published"], show_default=False, annotate=True)}</div>' for s in sets if s["latest"])
     keep_hint = ("Leave the list empty to keep this role profile's current rules without a rule set."
                  if keep_ok else "")
 
@@ -273,6 +277,21 @@ def role_form(mode: str, f: dict, errors: list[str], locations: dict, sets: list
               'box.querySelectorAll(".rs-preview").forEach(function(p){p.hidden=true;});'
               'vals.forEach(function(v){var p=box.querySelector(\'.rs-preview[data-rs="\'+CSS.escape(v)+\'"]\');'
               'if(p){box.appendChild(p);p.hidden=false;shown++;if(p.dataset.default==="2")block=true;}});'
+              'function rng(p){if(!p)return null;var x=p.split("-");return[+x[0],+(x[1]||x[0])];}'
+              'function covers(a,b){var A=a.split("|"),B=b.split("|");if(A[0]!=="0"&&A[0]!==B[0])return false;'
+              'if(A[1]!=="0"&&A[1]!==B[1])return false;if(A[2]){var ar=rng(A[2]),br=rng(B[2]);'
+              'if(!br||br[0]<ar[0]||br[1]>ar[1])return false;}if(A[3]&&A[3]!==B[3])return false;return true;}'
+              'var kept=[],dups=0,confl=0;box.querySelectorAll(".rs-preview").forEach(function(p){'
+              'p.querySelectorAll("tr[data-key]").forEach(function(tr){tr.classList.remove("dup","conflict");'
+              'var note=tr.querySelector(".rs-note");note.textContent="";if(p.hidden)return;var e=null;'
+              'for(var i=0;i<kept.length;i++){if(kept[i].set!==p.dataset.rs&&covers(kept[i].key,tr.dataset.key)){e=kept[i];break;}}'
+              'if(e){if(e.eff===tr.dataset.eff){tr.classList.add("dup");dups++;'
+              'note.textContent=" Left out: "+e.name+" in "+e.set+" already matches this traffic";return;}'
+              'tr.classList.add("conflict");confl++;note.textContent=" Never applies: "+e.name+" in "+e.set+" matches first";}'
+              'kept.push({set:p.dataset.rs,key:tr.dataset.key,eff:tr.dataset.eff,name:tr.dataset.name});});});'
+              'var sm=f.querySelector("#rsDupSummary");sm.hidden=!(dups||confl);'
+              'sm.textContent=(dups?dups+" duplicate rule"+(dups>1?"s":"")+" left out":"")+(dups&&confl?"; ":"")+'
+              '(confl?confl+" rule"+(confl>1?"s":"")+" never appl"+(confl>1?"y":"ies")+" (marked below)":"")+".";'
               'var d=f.querySelector("#rsDefault");d.hidden=!shown;d.textContent="Then the default rule: "+(block?"Block":"Allow")+'
               '(shown>1?(block?" (at least one rule set blocks by default)":" (every rule set allows by default)"):"")+".";'
               'f.querySelector("#newHint").hidden=!isNew;var b=f.querySelector("#saveBtn");'
@@ -327,6 +346,7 @@ def role_form(mode: str, f: dict, errors: list[str], locations: dict, sets: list
             '<button type="button" class="small" id="rsAdd">+ Add another rule set</button>'
             '<p class="sub" id="newHint" style="margin:8px 0 0" hidden>You\'ll create the rule set next, then come back here with it '
             'added. What you\'ve entered on this page is kept.</p>'
+            '<p class="flash pend" id="rsDupSummary" style="margin:10px 0 0" hidden></p>'
             f'<div id="rsPreviews">{previews}</div>'
             '<p class="sub" id="rsDefault" style="margin:10px 0 0" hidden></p>'
             '<p class="sub" style="margin:10px 0 0">Rules from each rule set are applied one after another, in this order, '
@@ -415,7 +435,7 @@ def ruleset_missing(name: str, linked) -> str:
 
 
 def rules_table(content: dict, compare: dict | None = None, editable: bool = False, name: str = "",
-                edit_i: int | None = None, show_default: bool = True) -> str:
+                edit_i: int | None = None, show_default: bool = True, annotate: bool = False) -> str:
     c = R.normalize(content)
     known = {R.describe(r) for r in (compare or {}).get("rules", [])} if compare is not None else None
     trs = []
@@ -432,8 +452,14 @@ def rules_table(content: dict, compare: dict | None = None, editable: bool = Fal
                      + btn("delete", "Delete", "danger") + "</td>")
         mark = ' <span class="pill pend">Changed</span>' if new else ""
         extra = f' <span class="tag">dscp {r["dscp"]}</span>' if r["dscp"] or r["mark"] != R.MARK_DEFAULT else ""
-        trs.append(f'<tr class="{"new" if new else ""}{" editing" if edit_i == i else ""}"><td class="n">{i + 1}</td>'
-                   f'<td>{esc(r["name"])}{mark}{extra}</td><td>{R.DIRECTIONS[r["direction"]]}</td>'
+        data = ""
+        if annotate:   # lets the role form's preview spot duplicates across rule sets
+            d, p_, port, host = R.match_key(r)
+            data = (f' data-key="{d}|{p_}|{esc(port)}|{esc(host)}" data-eff="{r["action"]}|{esc(r["mark"])}|{r["dscp"]}" '
+                    f'data-act="{r["action"]}" data-name="{esc(r["name"])}"')
+        note = '<span class="rs-note"></span>' if annotate else ""
+        trs.append(f'<tr class="{"new" if new else ""}{" editing" if edit_i == i else ""}"{data}><td class="n">{i + 1}</td>'
+                   f'<td>{esc(r["name"])}{mark}{extra}{note}</td><td>{R.DIRECTIONS[r["direction"]]}</td>'
                    f'<td>{R.protocol_label(r["protocol"])}</td><td>{esc(r["port"]) or "Any"}</td>'
                    f'<td>{esc(r["host"]) or "Any"}</td><td>{R.ACTIONS[r["action"]]}</td>{tools}</tr>')
     if editable:
@@ -453,7 +479,7 @@ def rules_table(content: dict, compare: dict | None = None, editable: bool = Fal
     return f'<div class="tw"><table>{head}{"".join(trs)}</table></div>'
 
 
-def role_detail(row, current, sets, target, changes) -> str:
+def role_detail(row, current, sets, target, changes, notes=None) -> str:
     role = row.role
     tid, loc = row.template_id, row.location_id
     hidden = f'{CSRF}<input type="hidden" name="loc" value="{esc(loc)}">'
@@ -503,6 +529,7 @@ def role_detail(row, current, sets, target, changes) -> str:
             f'<div class="row" style="justify-content:space-between"><h1>{esc(role.get("templateName"))}</h1>{head_buttons}</div>'
             f'<p class="sub">{esc(role.get("description")) or "No description"}</p>'
             + info + "".join(actions) +
+            (f'<div class="card"><h2>Combining {label_html}</h2>{combine_notes(notes)}</div>' if notes else "") +
             f'<div class="card"><h2>Firewall rules on CV-CUE</h2>'
             f'{rules_table(current) if role.get("firewallEnabled") else "<p>Firewall is off for this role profile.</p>"}</div>'
             f'<div class="card"><h2>Manage</h2><div class="row" style="gap:16px">{"".join(manage)}</div>'
@@ -511,7 +538,7 @@ def role_detail(row, current, sets, target, changes) -> str:
             'rule set blocks by default). VLAN, traffic control, and web quarantine settings stay as they are.</p></div>')
 
 
-def link_review(role, loc, names, content, changes) -> str:
+def link_review(role, loc, names, content, changes, notes=None) -> str:
     tid = role["templateId"]
     label_html = " + ".join(esc(n) for n in names)
     lines = "".join(_diff_line(k, t) for k, t in changes) or "No firewall changes; only the description tags change."
@@ -520,13 +547,22 @@ def link_review(role, loc, names, content, changes) -> str:
             f'{esc(role["templateName"])}</a> / Link</div><h1>Link {esc(role["templateName"])} to {label_html}</h1>'
             '<p class="sub">This applies the latest published version of each rule set, in this order, and tags the role '
             'profile so later publishes update it too.</p>'
-            f'<div class="card"><h2>Changes on CV-CUE</h2><div class="diff">{lines}</div>'
+            f'<div class="card"><h2>Changes on CV-CUE</h2>{combine_notes(notes or [])}<div class="diff">{lines}</div>'
             f'<div class="diff">~ description: "{esc(role.get("description") or "")}" → '
             f'"{esc(R.set_tags(role.get("description"), names))}"</div>'
             f'<form method="post" action="/roles/{tid}/link" class="row" style="margin-top:12px">{CSRF}'
             f'<input type="hidden" name="loc" value="{esc(loc)}">{keep}'
             '<button class="primary">Link and apply</button>'
             f'<a class="btn" href="/roles/{tid}?loc={esc(loc)}">Cancel</a></form></div>')
+
+
+def combine_notes(notes: list[str]) -> str:
+    """Duplicates left out and rules that never apply, from combining rule sets."""
+    if not notes:
+        return ""
+    items = "".join(f"<li>{esc(n)}</li>" for n in notes)
+    return (f'<div class="flash pend" style="margin:8px 0 0"><b>Combining these rule sets</b>'
+            f'<ul style="margin:6px 0 0;padding-left:18px">{items}</ul></div>')
 
 
 def _out_pill(out: int) -> str:
@@ -588,9 +624,12 @@ def ruleset_editor(rs, rows, edit_i, form_errors, role_draft=None) -> str:
             f'{_out_pill(out)}</div>'
             f'<div class="stat" style="grid-column:span 2"><div class="l">Role profiles</div>{used}</div></div>')
     compare = rs["published"] if rs["latest"] else None
+    issues = R.issues_in(draft)
+    issue_html = ("<div class=\"flash pend\"><b>Check these rules</b><ul style=\"margin:6px 0 0;padding-left:18px\">"
+                  + "".join(f"<li>{esc(t)}</li>" for t in issues) + "</ul></div>") if issues else ""
     table = (f'<div class="card"><div class="row" style="justify-content:space-between"><h2>Firewall rules (Layer 3-4)</h2>'
              '<span class="sub" style="margin:0">Evaluated top to bottom; the default rule applies last.</span></div>'
-             f'{rules_table(draft, compare, True, name, edit_i)}'
+             f'{issue_html}{rules_table(draft, compare, True, name, edit_i)}'
              + (f'<form method="post" action="/rulesets/{esc(name)}/edit" style="margin-top:10px">{CSRF}'
                 '<input type="hidden" name="op" value="discard"><button class="small">Discard draft changes</button></form>'
                 if rs["has_changes"] and rs["latest"] else "") + "</div>")
@@ -687,7 +726,7 @@ def review(plan, draft=None) -> str:
                     if others else "")
         blocks.append(f'<div style="margin-bottom:12px"><div>{role_link(item.row)} '
                       f'<span style="color:var(--muted)">· {esc(item.row.location)}</span> {status_pill(item.row)}{combined}</div>'
-                      f'<div class="diff">{body}</div></div>')
+                      f'<div class="diff">{body}</div>{combine_notes(item.notes)}</div>')
     can = plan.new_version or upd
     button = (f'<form method="post" action="/rulesets/{esc(name)}/publish" class="row">{CSRF}'
               f'<input type="hidden" name="token" value="{esc(plan.token)}">'

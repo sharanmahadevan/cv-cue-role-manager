@@ -125,17 +125,111 @@ def set_tag(description: str | None, name: str | None) -> str:
     return set_tags(description, [name] if name else [])
 
 
-def compose(contents: list[dict]) -> dict:
+def match_key(r: dict) -> tuple:
+    """The traffic a rule matches: (direction, protocol, port, host). Empty/0 means any."""
+    r = _norm_rule(r)
+    return (r["direction"], r["protocol"], r["port"], r["host"].lower())
+
+
+def _port_range(port: str) -> tuple[int, int] | None:
+    if not port:
+        return None
+    lo, _, hi = port.partition("-")
+    return int(lo), int(hi or lo)
+
+
+def covers(a: dict, b: dict) -> bool:
+    """True if rule `a` matches all the traffic rule `b` matches (so `b` after `a` can never match first).
+
+    A field set to Any in `a` covers every value; a port range covers the ports inside it.
+    """
+    (ad, ap, aport, ah), (bd, bp, bport, bh) = match_key(a), match_key(b)
+    if ad and ad != bd:
+        return False
+    if ap and ap != bp:
+        return False
+    if aport:
+        ar, br = _port_range(aport), _port_range(bport)
+        if br is None or not (ar[0] <= br[0] and br[1] <= ar[1]):
+            return False
+    if ah and ah != bh:
+        return False
+    return True
+
+
+def _effect(r: dict) -> tuple:
+    r = _norm_rule(r)
+    return (r["action"], r["mark"], r["dscp"])
+
+
+def combine(named: list[tuple[str, dict]]) -> tuple[dict, list[dict], list[dict]]:
     """Combine rule sets in order: their rules one after another, then one default rule.
 
-    The default rule blocks if any of the rule sets blocks by default, so adding a rule set
-    never opens up traffic that another one denies.
+    Returns (content, skipped, conflicts), comparing each rule with the rules kept from earlier
+    rule sets (the first match wins in CV-CUE):
+    - skipped: an earlier rule set already has a rule covering all of this rule's traffic with the
+      same action. This rule would never apply and removing it changes nothing, so it's left out.
+    - conflicts: an earlier rule set has a rule covering this rule's traffic with a different action
+      (or DSCP marking). It's kept, but never applies, because the earlier rule matches first.
+    Rules inside one rule set are kept as written (see `issues_in`).
+    The default rule blocks if any of the rule sets blocks by default, so adding a rule set never
+    opens up traffic that another one denies.
     """
-    contents = [normalize(c) for c in contents]
-    if not contents:
-        return empty_content()
-    return {"rules": [r for c in contents for r in c["rules"]],
-            "default_action": 2 if any(c["default_action"] == 2 for c in contents) else 1}
+    if not named:
+        return empty_content(), [], []
+    kept: list[tuple[dict, str]] = []
+    skipped: list[dict] = []
+    conflicts: list[dict] = []
+    defaults = []
+    for set_name, content in named:
+        c = normalize(content)
+        defaults.append(c["default_action"])
+        for r in c["rules"]:
+            earlier = next(((e, es) for e, es in kept if es != set_name and covers(e, r)), None)
+            if earlier:
+                note = {"rule": r, "set": set_name, "by": earlier[0], "by_set": earlier[1],
+                        "exact": match_key(earlier[0]) == match_key(r)}
+                if _effect(earlier[0]) == _effect(r):
+                    skipped.append(note)
+                    continue
+                conflicts.append(note)          # different action or marking: kept, but never applies
+            kept.append((r, set_name))
+    return {"rules": [r for r, _ in kept], "default_action": 2 if 2 in defaults else 1}, skipped, conflicts
+
+
+def compose(contents: list[dict]) -> dict:
+    """Combined content only (see `combine`); rule sets are told apart by position."""
+    return combine([(f"#{i}", c) for i, c in enumerate(contents)])[0]
+
+
+def note_text(note: dict, kind: str) -> str:
+    r, by = _norm_rule(note["rule"]), _norm_rule(note["by"])
+    how = "the same traffic" if note.get("exact", True) else "all of its traffic"
+    if kind == "skipped":
+        return (f'{r["name"]} in {note["set"]} left out: {by["name"]} in {note["by_set"]} already matches '
+                f'{how} with the same action')
+    return (f'{r["name"]} in {note["set"]} never applies: {by["name"]} in {note["by_set"]} matches '
+            f'{how} first ({ACTIONS[by["action"]].lower()})')
+
+
+def issues_in(content: dict) -> list[str]:
+    """Rules inside one rule set that can never apply because an earlier rule covers them."""
+    out = []
+    rules = normalize(content)["rules"]
+    for i, r in enumerate(rules):
+        j = next((j for j in range(i) if covers(rules[j], r)), None)
+        if j is None:
+            continue
+        earlier = rules[j]
+        same = match_key(earlier) == match_key(r)
+        if _effect(earlier) == _effect(r):
+            what = "duplicates" if same else "is already covered by"
+            out.append(f'Rule {i + 1} ({r["name"]}) {what} rule {j + 1} ({earlier["name"]}).')
+        else:
+            how = "the same traffic" if same else "all of its traffic"
+            out.append(f'Rule {i + 1} ({r["name"]}) never applies: rule {j + 1} ({earlier["name"]}) matches '
+                       f'{how} first.')
+    return out
 
 
 # ------------------------------------------------------------ display and diff

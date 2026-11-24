@@ -178,11 +178,12 @@ def create_app(cfg: Settings, api=None) -> Starlette:
         versions = {s["name"]: await db(store.versions, s["name"]) for s in sets}
         applied = await db(store.applied_fingerprints)
         row = portal.classify(role, locs.get(loc, f"Location {loc}"), versions, applied.get(tid))
-        target = None
+        target, notes = None, []
         if row.rulesets and not row.missing:
-            target, _ = await portal.latest_contents(row.rulesets)
+            target, _, skipped, conflicts = await portal.combine_latest(row.rulesets)
+            notes = [R.note_text(n, "skipped") for n in skipped] + [R.note_text(n, "conflict") for n in conflicts]
         changes = R.diff(R.from_role(role), target) if target and row.status != "in_sync" else []
-        return page(request, role["templateName"], P.role_detail(row, current, sets, target, changes), "roles")
+        return page(request, role["templateName"], P.role_detail(row, current, sets, target, changes, notes), "roles")
 
     async def link_review(request: Request) -> Response:
         tid = int(request.path_params["tid"])
@@ -191,13 +192,14 @@ def create_app(cfg: Settings, api=None) -> Starlette:
         for n in request.query_params.getlist("rulesets") + request.query_params.getlist("ruleset"):
             if n and n not in names:
                 names.append(n)
-        content, missing = await portal.latest_contents(names)
+        content, missing, skipped, conflicts = await portal.combine_latest(names)
+        notes = [R.note_text(n, "skipped") for n in skipped] + [R.note_text(n, "conflict") for n in conflicts]
         if not names or missing:
             flash(request, "error", f"Publish {', '.join(missing) or 'a rule set'} before linking role profiles to it.")
             return RedirectResponse(f"/roles/{tid}?loc={loc}", 303)
         role = await portal.get_role(tid, loc)
         changes = R.diff(R.from_role(role), content)
-        return page(request, "Link role profile", P.link_review(role, loc, names, content, changes), "roles")
+        return page(request, "Link role profile", P.link_review(role, loc, names, content, changes, notes), "roles")
 
     async def role_action(request: Request) -> Response:
         tid = int(request.path_params["tid"])
